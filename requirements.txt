@@ -1,0 +1,3 @@
+pyobjc-framework-Cocoa>=12
+pyobjc-framework-Quartz>=12
+pyobjc-framework-Vision>=12
