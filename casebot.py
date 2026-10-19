@@ -11,7 +11,6 @@ import json
 import math
 import os
 import re
-import resource
 import subprocess
 import sys
 import tempfile
@@ -21,15 +20,22 @@ import traceback
 from dataclasses import dataclass, field, asdict, replace
 from typing import Dict, List, Optional, Tuple
 
-import objc
-import Quartz
-import Vision
-from Foundation import NSURL
-from AppKit import (
-    NSRunningApplication,
-    NSEvent,
-    NSApplicationActivateIgnoringOtherApps,
-)
+# Windows runs the same bot through winplat.py, swapped in at the bottom of this file.
+WINDOWS = sys.platform == "win32"
+if not WINDOWS:
+    import resource
+    import objc
+    import Quartz
+    import Vision
+    from Foundation import NSURL
+    from AppKit import (
+        NSRunningApplication,
+        NSEvent,
+        NSApplicationActivateIgnoringOtherApps,
+    )
+
+# Drains what the macOS frameworks autorelease (see ocr). Windows has nothing to drain.
+_pool = contextlib.nullcontext if WINDOWS else objc.autorelease_pool
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_PATH = os.path.join(HERE, "settings.json")
@@ -431,6 +437,21 @@ def grab(wid: int):
     return _capture(["-o", "-l", str(wid)])
 
 
+def notify(message: str) -> None:
+    """A macOS notification with a sound, for something only a person can fix.
+
+    2026-10-02: screen capture stopped for every app on the Mac (the screenshot keys
+    too), and the bot could only retry. It still retries and carries on when capture
+    comes back; this is so the person sees it while it is happening.
+    """
+    script = 'display notification %s with title "casebot" sound name "Basso"' % json.dumps(message)
+    try:
+        subprocess.Popen(["osascript", "-e", script],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
 def grab_region(bounds: dict):
     """Capture the screen area a window covers: whatever is drawn there, on top.
 
@@ -544,6 +565,16 @@ def prune_failures(keep: int = KEEP_FAILURES) -> int:
     return dropped
 
 
+# Cyrillic letters Vision returns for their Latin twins: the trading server's ACCEPT
+# button read as 'АССЕРТ' (2026-10-07) and matched nothing. The game writes English.
+_LATIN = str.maketrans("АВСЕНКМОРТХаеорсухі", "ABCEHKMOPTXaeopcyxi")
+
+
+def img_size(img) -> Tuple[int, int]:
+    """(width, height) of a capture, in pixels."""
+    return Quartz.CGImageGetWidth(img), Quartz.CGImageGetHeight(img)
+
+
 def ocr(img) -> List[Line]:
     """Apple Vision text recognition. Pixel boxes, top-left origin.
 
@@ -568,7 +599,7 @@ def ocr(img) -> List[Line]:
             bb = r.boundingBox()
             out.append(
                 Line(
-                    text=str(cands[0].string()),
+                    text=str(cands[0].string()).translate(_LATIN),
                     conf=float(cands[0].confidence()),
                     x=bb.origin.x * W,
                     y=(1 - bb.origin.y - bb.size.height) * H,
@@ -676,9 +707,64 @@ def _luma_grid(img, x0: float, y0: float, x1: float, y1: float, cols: int, rows:
     return out
 
 
+def find_hub_shop(img) -> Optional[Line]:
+    """The trading server's golden shop icon, bottom left, as a Line over it; else None.
+
+    The trading hub (2026-10-07) opens the market from an icon with no text: a pale
+    yellow storefront on a dark square, the first of the row along the bottom left.
+    Measured on infinite's screenshot: red and green about 250, blue 100 to 177, on
+    (30, 30, 30). Sand, wood and the orange loading screen all fail red-and-green-high
+    with blue well below.
+    """
+    if img is None:
+        return None
+    W, H = img_size(img)
+    x0, y0, x1, y1 = 0.0, H * 0.80, W * 0.12, float(H)
+    cols, rows = 48, 40
+    g = _rgb_grid(img, x0, y0, x1, y1, cols, rows)
+    hits = [(c, r) for r, row in enumerate(g) for c, (red, green, blue) in enumerate(row)
+            if red > 220 and green > 205 and blue < 190 and min(red, green) - blue > 60]
+    if len(hits) < HUB_ICON_CELLS:
+        return None
+    cx = x0 + (sum(c for c, _ in hits) / len(hits) + 0.5) * (x1 - x0) / cols
+    cy = y0 + (sum(r for _, r in hits) / len(hits) + 0.5) * (y1 - y0) / rows
+    return Line("SHOP ICON", 1.0, cx - 1.0, cy - 1.0, 2.0, 2.0)
+
+
+HUB_ICON_CELLS = 6      # yellow cells of 48 x 40 over the corner that make an icon
+
+
+def _rgb_grid(img, x0: float, y0: float, x1: float, y1: float, cols: int, rows: int):
+    """One region of a capture as rows x cols of (r, g, b), the _luma_grid way."""
+    W, H = Quartz.CGImageGetWidth(img), Quartz.CGImageGetHeight(img)
+    x0, y0 = max(0.0, float(x0)), max(0.0, float(y0))
+    x1, y1 = min(float(x1), W), min(float(y1), H)
+    if x1 <= x0 or y1 <= y0:
+        return []
+    with objc.autorelease_pool():
+        sub = Quartz.CGImageCreateWithImageInRect(img, Quartz.CGRectMake(x0, y0, x1 - x0, y1 - y0))
+        ctx = Quartz.CGBitmapContextCreate(
+            None, cols, rows, 8, cols * 4, Quartz.CGColorSpaceCreateDeviceRGB(),
+            Quartz.kCGImageAlphaPremultipliedFirst | Quartz.kCGBitmapByteOrder32Little,
+        )
+        if sub is None or ctx is None:
+            return []
+        Quartz.CGContextDrawImage(ctx, Quartz.CGRectMake(0, 0, cols, rows), sub)
+        small = Quartz.CGBitmapContextCreateImage(ctx)
+        data = Quartz.CGDataProviderCopyData(Quartz.CGImageGetDataProvider(small)) if small else None
+        if data is None:
+            return []
+        mv = memoryview(data)
+        bpr = Quartz.CGImageGetBytesPerRow(small)
+        out = [[(mv[r * bpr + c * 4 + 2], mv[r * bpr + c * 4 + 1], mv[r * bpr + c * 4])
+                for c in range(cols)] for r in range(rows)]
+        del mv
+    return out
+
+
 def mean_brightness(img) -> float:
     """Average brightness of the grid area. The loading overlay dims it to about 11."""
-    W, H = Quartz.CGImageGetWidth(img), Quartz.CGImageGetHeight(img)
+    W, H = img_size(img)
     r, g, b = _sample(img, W * 0.20, H * 0.25, W * 0.98, H * 0.85)
     return (r + g + b) / 3.0
 
@@ -773,6 +859,27 @@ def find_confirm(lines: List[Line]) -> Optional[Line]:
     return find_button(lines, "CONFI", avoid="PURCHASE")
 
 
+def find_tab(lines: List[Line], label: str) -> Optional[Line]:
+    """The MARKET or SELL tab to click: on the top bar, beside PROFILE.
+
+    Since the game update of 2026-10-07 the bottom bar has a MARKET of its own, and
+    from the SELL tab it does not switch back: clicked from there, the bot pressed it
+    over and over. The top tab reads loosely too, Vision gluing its icon on ('MARKET
+    G'). The main menu has no top bar and no PROFILE, and there the bar's MARKET is
+    the way in.
+    """
+    want = label.upper()
+    named = [l for l in lines
+             if l.text.strip().upper() == want or l.text.strip().upper().startswith(want + " ")]
+    profiles = [l for l in lines if l.text.strip().upper() == "PROFILE"]
+    if profiles:
+        p = min(profiles, key=lambda l: l.y)
+        named = [l for l in named if abs(l.cy - p.cy) < 1.5 * p.h]
+    else:
+        named = [l for l in named if l.text.strip().upper() == want]
+    return min(named, key=lambda l: (l.y, l.x), default=None)
+
+
 def on_market(lines: List[Line]) -> bool:
     """The MARKET tab: only it carries the category row across the top."""
     texts = {l.text.strip().lower() for l in lines}
@@ -792,11 +899,13 @@ def on_disconnected(lines: List[Line]) -> bool:
 def on_lobby(lines: List[Line]) -> bool:
     """The game's main menu, which is where Roblox drops us on join and after a kick.
 
-    Its bottom bar is PLAY, MARKET, INVENTORY and friends. The market has none of
-    PLAY, INVENTORY or GAMEMODES, so any two of those three is the lobby.
+    Its bottom bar is PLAY, MARKET, INVENTORY and friends. Since the game update
+    of 2026-10-07 the market and SELL show that bar too, so the lobby is the bar
+    without the market's top tabs: no PROFILE there.
     """
     texts = {l.text.strip().upper() for l in lines}
-    return len(texts & {"PLAY", "INVENTORY", "GAMEMODES"}) >= 2 and "MARKET" in texts
+    return (len(texts & {"PLAY", "INVENTORY", "GAMEMODES"}) >= 2 and "MARKET" in texts
+            and "PROFILE" not in texts)
 
 
 def on_sell(lines: List[Line]) -> bool:
@@ -853,13 +962,21 @@ def parse_sell_filters(lines: List[Line]) -> dict:
     return out
 
 
+# Which way the SELL tab's sort arrow is set. Up was the setting from the start
+# (2026-09-23, read as newest on top), and fresh crates kept turning up below the
+# first screen. infinite, 2026-10-02: "I think we have been using the wrong
+# direction", so down. If newest turns out to be at the bottom after all, flip it.
+SELL_ARROW = "down"
+
+
 def sort_direction(img, sort: Optional[Line], search: Optional[Line]):
     """Which way the sort arrow next to the sort dropdown points: 'up', 'down' or None.
 
     The icon is not text, and Vision only reads it at all in one of its two states,
     so it is found by brightness in the gap between the sort box and the search box.
-    Up (newest on top) has its shaft right of the lines and the head at the top;
-    down is the mirror image. Both have to agree, or the answer is None.
+    Up has its shaft right of the lines and the head at the top; down is the
+    mirror image. Both have to agree, or the answer is None. Which one the SELL
+    view wants is SELL_ARROW.
 
     Also returns a Line over the icon's centre, for clicking it.
     """
@@ -909,13 +1026,30 @@ class Card:
     is_case: bool
 
 
+# Letters Vision reads in place of a digit. Only ever applied after a '#', where a
+# crate's name holds a number: infinite, 2026-10-02, 'Charm Pack #1' read as
+# 'Charm Pack #T', which matched no crate, so it was never sold and the dashboard
+# listed it as a crate of its own.
+_DIGIT_LOOKALIKES = str.maketrans({"T": "1", "I": "1", "l": "1", "i": "1", "|": "1", "!": "1",
+                                   "O": "0", "o": "0"})
+
+
+def fix_number(name: str) -> str:
+    """A crate name with the number after its '#' read back as digits: '#T' is '#1'."""
+    head, sep, tail = name.rpartition("#")
+    if not sep or not tail:
+        return name
+    fixed = tail.translate(_DIGIT_LOOKALIKES)
+    return head + sep + fixed if fixed.isdigit() else name
+
+
 def _title_name(text: str) -> Optional[Tuple[str, bool]]:
     """(name, is_case) for a card title line, else None."""
     m = CASE_RE.match(text)
     if m:
         # Vision sometimes doubles the separator ("Case | |Apex Case"), which left a
         # leading pipe in the name and then mismatched the modal title check.
-        return m.group(1).strip().lstrip("|").strip(), True
+        return fix_number(m.group(1).strip().lstrip("|").strip()), True
     m = GENERIC_RE.match(text)
     if m:
         return text.strip(), False
@@ -1028,6 +1162,27 @@ def parse_cards(lines: List[Line], img_w: int) -> List[Card]:
     return cards
 
 
+def _counter_row(lines: List[Line]):
+    """(PROFILE on the top bar, the x the coin counter ends before), or None.
+
+    The counter sits right of PROFILE, up to the top bar's CLOSE. The game update of
+    2026-10-07 took that CLOSE away (icon buttons, no text, in its place), and the
+    balance read as None for every frame. With no CLOSE on PROFILE's row the bound
+    is five PROFILE widths, which reaches past the counter in both layouts: measured
+    2,978 ending at x=2567 against 1934 + 5 x 176 = 2814, and the old 2793..2878
+    against 2186 + 5 x 191 = 3141, the old CLOSE's own x.
+    """
+    profiles = [l for l in lines if l.text.strip().upper() == "PROFILE"]
+    if not profiles:
+        return None
+    left = min(profiles, key=lambda l: l.y)
+    # a dialog brings its own CLOSE button: the one that matters shares PROFILE's row
+    closes = [l for l in lines if l.text.strip().upper() == "CLOSE" and l.x > left.x
+              and abs(l.cy - left.cy) < 1.5 * left.h]
+    right = min(closes, key=lambda l: l.x).x if closes else left.x + 5 * left.w
+    return left, right
+
+
 def parse_balance(lines: List[Line]) -> Optional[int]:
     """The coin counter: the bare integer on the tab row, between PROFILE and CLOSE.
 
@@ -1037,20 +1192,14 @@ def parse_balance(lines: List[Line]) -> Optional[int]:
     62, 77). The bot kept buying with 2 coins, the game refused every CONFIRM, and
     five refusals ended the run. No counter read means no balance, never a guess.
     """
-    profiles = [l for l in lines if l.text.strip().upper() == "PROFILE"]
-    if not profiles:
+    found = _counter_row(lines)
+    if found is None:
         return None
-    left = min(profiles, key=lambda l: l.y)
-    # a dialog brings its own CLOSE button: the one that matters shares PROFILE's row
-    closes = [l for l in lines if l.text.strip().upper() == "CLOSE" and l.x > left.x]
-    if not closes:
-        return None
-    right = min(closes, key=lambda l: abs(l.cy - left.cy))
-    row, h = (left.cy + right.cy) / 2.0, max(left.h, right.h)
+    left, right = found
     ints = [
         l for l in lines
         if BALANCE_RE.match(l.text.strip().replace(",", ""))
-        and abs(l.cy - row) < h and left.x + left.w < l.cx < right.x
+        and abs(l.cy - left.cy) < left.h and left.x + left.w < l.cx < right
     ]
     if not ints:
         return None
@@ -1059,15 +1208,11 @@ def parse_balance(lines: List[Line]) -> Optional[int]:
 
 def counter_strip(lines: List[Line]):
     """The coin counter's strip on the tab row: (x0, y0, x1, y1) or None."""
-    profiles = [l for l in lines if l.text.strip().upper() == "PROFILE"]
-    if not profiles:
+    found = _counter_row(lines)
+    if found is None:
         return None
-    left = min(profiles, key=lambda l: l.y)
-    closes = [l for l in lines if l.text.strip().upper() == "CLOSE" and l.x > left.x]
-    if not closes:
-        return None
-    right = min(closes, key=lambda l: abs(l.cy - left.cy))
-    return (left.x + left.w, left.cy - 1.5 * left.h, right.x, left.cy + 1.5 * left.h)
+    left, right = found
+    return (left.x + left.w, left.cy - 1.5 * left.h, right, left.cy + 1.5 * left.h)
 
 
 def _scaled_crop(img, box, k: float):
@@ -1091,7 +1236,11 @@ def _scaled_crop(img, box, k: float):
 # read '11' ten times in twelve (the box started one glyph late), and the strip alone
 # read 111 at 0.35x, nothing at 0.5x, 111 at 0.75x, 117 at 1x, 111 at 1.5x, LLL at 2x.
 # No single read is trustworthy; three of these agreeing with the frame is.
-COUNTER_SCALES = (0.35, 0.75, 1.5)
+# 2026-10-02, a counter showing a lone 4: those three scales all read nothing, the
+# vote had only the frame's 4, and the balance was "unreadable" for good. Single
+# glyphs read at 0.5x, 2x and 3x (and 111 still wins at 0.35x, 0.75x, 1.5x, with
+# 2x and 3x reading LLL), so all six vote: ~0.15 s, only when the coins change.
+COUNTER_SCALES = (0.35, 0.5, 0.75, 1.5, 2.0, 3.0)
 
 
 def vote_counter(img, lines: List[Line]) -> Optional[str]:
@@ -1111,10 +1260,12 @@ def vote_counter(img, lines: List[Line]) -> Optional[str]:
         crop = _scaled_crop(img, box, k)
         if crop is None:
             continue
-        digits = [l.text.strip().replace(",", "") for l in ocr(crop)]
-        digits = [d for d in digits if BALANCE_RE.match(d)]
+        # the longest, and of those the rightmost: the strip starts at the coin icon,
+        # which RapidOCR (Windows) reads as an 8 now and then
+        digits = [(l.text.strip().replace(",", ""), l.x) for l in ocr(crop)]
+        digits = [(d, x) for d, x in digits if BALANCE_RE.match(d)]
         if digits:
-            votes.append(max(digits, key=len))
+            votes.append(max(digits, key=lambda dx: (len(dx[0]), dx[1]))[0])
     if not votes:
         return None
     best = max(set(votes), key=lambda v: (votes.count(v), len(v)))
@@ -1141,7 +1292,9 @@ def find_text(lines: List[Line], needle: str) -> Optional[Line]:
     for l in lines:
         if needle in l.text.upper():
             return l
-    return None
+    # Then whatever the spaces: RapidOCR (Windows) puts one inside a word now and
+    # then ('Search for Item s...'), the way Vision runs two together.
+    return find_loose(lines, needle)
 
 
 def find_button(lines: List[Line], needle: str, avoid: Optional[str] = None) -> Optional[Line]:
@@ -1167,11 +1320,18 @@ def ui_state(lines: List[Line], img=None) -> str:
 
     'market_ready' | 'market_nofilter' | 'cooldown' | 'loading' | 'modal' |
     'modal_scrolled' | 'confirm' | 'sell_confirm' | 'setprice' | 'sell' | 'lobby' |
-    'disconnected' | 'unknown'
+    'trade_rules' | 'hub' | 'disconnected' | 'unknown'
     """
     # Roblox draws this box over whatever the game was showing, so it goes first.
     if on_disconnected(lines):
         return "disconnected"
+    # The game's own loading screen, joining either the main game or a trading
+    # server (2026-10-07): bright orange, so the dim test below never sees it.
+    if find_text(lines, "Loading Assets") is not None:
+        return "loading"
+    # A trading server greets every join with its rules, ACCEPT to go on.
+    if find_text(lines, "TRADE RULES") is not None and find_button(lines, "ACCEPT") is not None:
+        return "trade_rules"
     # Both confirmation dialogs are headed "Confirm Purchase", even the one that
     # sells, so the sentence underneath is what tells them apart.
     if find_text(lines, "sell your selected") is not None:
@@ -1206,6 +1366,9 @@ def ui_state(lines: List[Line], img=None) -> str:
         return "cooldown"
     if on_lobby(lines):
         return "lobby"
+    # The trading hub: the world, and the shop icon that opens the market.
+    if find_hub_shop(img) is not None:
+        return "hub"
     return "unknown"
 
 
@@ -1402,31 +1565,44 @@ def parse_setprice(lines: List[Line]) -> dict:
 
 
 BASKET_READS = 3     # frames to get every basket row read back before refusing to sell
+STILL_READS = 4      # reads to wait for a scrolled grid to stop before clicking on it
+STILL_GAP = 0.15     # seconds between them
+SELL_MISSES = 3      # SELL NOW clicks that open nothing, in one trip, before it gives up
 
 
-def parse_basket(lines: List[Line]) -> Optional[List[int]]:
-    """The prices in the SELL tab's basket panel, top to bottom; None with no panel read.
+def basket_rows(lines: List[Line]) -> List[Tuple[Line, Optional[int]]]:
+    """The SELL tab's basket, top to bottom: each row's 'Price' heading and its price.
 
-    The panel heads its columns 'Case' and 'Price' and prints each staged crate's
-    price under the second, full size, after the Set Price sheet has closed. It is
-    what SELL ITEMS will list at, so it has the last word on what was typed.
+    Every staged crate's row heads itself 'Case' and 'Price' and prints the price
+    under the second, full size, after the Set Price sheet has closed. It is what
+    SELL ITEMS will list at, so it has the last word on what was typed. A price
+    Vision missed on this frame is None, for a closer read (Bot._row_price), not a
+    row gone: four rows of plain 44s read as three on 2026-10-02 and the basket
+    was refused for it.
     """
-    head = next(
+    heads = sorted(
         (p for p in lines
          if p.text.strip().lower() == "price"
          and any(c.text.strip().lower() == "case" and c.x < p.x and abs(c.cy - p.cy) < p.h
                  for c in lines)),
-        None,
+        key=lambda p: p.y,
     )
-    if head is None:
-        return None
-    # One header width either side and no more: a name such as 'Glove Case 2' that
-    # Vision splits leaves its '2' further left, and that is not a price.
-    return [
-        int(l.text.strip())
-        for l in sorted(lines, key=lambda l: l.y)
-        if l.y > head.y and abs(l.cx - head.cx) < head.w and PRICE_RE.match(l.text.strip())
-    ]
+    rows = []
+    for i, head in enumerate(heads):
+        below = heads[i + 1].y if i + 1 < len(heads) else float("inf")
+        # One heading width either side and no more: a name such as 'Glove Case 2'
+        # that Vision splits leaves its '2' further left, and that is not a price.
+        found = [l for l in sorted(lines, key=lambda l: l.y)
+                 if head.y < l.y < below and abs(l.cx - head.cx) < head.w
+                 and PRICE_RE.match(l.text.strip())]
+        rows.append((head, int(found[0].text.strip()) if found else None))
+    return rows
+
+
+def parse_basket(lines: List[Line]) -> Optional[List[int]]:
+    """The basket prices this frame read, top to bottom; None with no basket panel."""
+    rows = basket_rows(lines)
+    return [p for _, p in rows if p is not None] if rows else None
 
 
 def _digits_seen(sheet: dict) -> int:
@@ -1602,12 +1778,21 @@ def wait_idle(s: Settings, stop_event: Optional[threading.Event] = None) -> bool
     while True:
         if stop_event is not None and stop_event.is_set():
             return False
-        idle = Quartz.CGEventSourceSecondsSinceLastEventType(
-            Quartz.kCGEventSourceStateCombinedSessionState, Quartz.kCGAnyInputEventType
-        )
-        if idle >= target:
+        if _session_idle() >= target:
             return True
         time.sleep(0.2)
+
+
+def _session_idle() -> float:
+    """Seconds since the last input from anywhere in this login session."""
+    return Quartz.CGEventSourceSecondsSinceLastEventType(
+        Quartz.kCGEventSourceStateCombinedSessionState, Quartz.kCGAnyInputEventType
+    )
+
+
+def _peak_mb() -> float:
+    """The most memory this process has held, in MB (ru_maxrss is bytes on a Mac)."""
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024.0 * 1024.0)
 
 
 def _topmost_pid_at(point: Tuple[float, float], ignore_pid: Optional[int] = None) -> Optional[int]:
@@ -1678,7 +1863,7 @@ class _PSN(ctypes.Structure):
 
 
 try:
-    _HISERVICES = ctypes.CDLL(
+    _HISERVICES = None if WINDOWS else ctypes.CDLL(
         "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
     )
 except OSError:
@@ -1726,16 +1911,12 @@ def bring_forward(pid: int, timeout: float = ACTIVATE_TIMEOUT):
     bot thread has no runloop to drain the pool they land in. The returned app is
     safe to keep, because PyObjC retains anything it wraps.
     """
-    with objc.autorelease_pool():
+    with _pool():
         front = _active_pid()
-        prev = (
-            NSRunningApplication.runningApplicationWithProcessIdentifier_(front)
-            if front is not None and front != pid
-            else None
-        )
-        rb = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+        prev = _app_for(front) if front is not None and front != pid else None
+        rb = _app_for(pid)
         if rb is not None:
-            rb.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+            _activate(rb)
     # Activation lands when it lands, and a click before it goes to macOS as the
     # window's focusing click: focused mode's first SELL click was lost that way
     # every time (infinite, 2026-09-30). So wait for Roblox to be the front app.
@@ -1746,11 +1927,30 @@ def bring_forward(pid: int, timeout: float = ACTIVATE_TIMEOUT):
     return prev
 
 
+def _app_for(pid: int):
+    """The running app with that pid, as _activate takes it, or None."""
+    return NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+
+
+def _activate(app) -> None:
+    app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+
+
+def _point(x: float, y: float):
+    """A global point the event calls take, with .x and .y."""
+    return Quartz.CGPointMake(x, y)
+
+
+def _warp(pt) -> None:
+    """Move the pointer there. No event: it is not input (see _input_idle)."""
+    Quartz.CGWarpMouseCursorPosition(pt)
+
+
 def hand_back(prev, cursor_point) -> None:
     if cursor_point is not None:
-        Quartz.CGWarpMouseCursorPosition(cursor_point)
+        _warp(cursor_point)
     if prev is not None:
-        prev.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+        _activate(prev)
 
 
 def _burst(pid: int, point: Tuple[float, float], post, prev_app=None, hold: bool = False) -> bool:
@@ -1763,7 +1963,7 @@ def _burst(pid: int, point: Tuple[float, float], post, prev_app=None, hold: bool
     The pool is the same story as read(): NSEvent and NSRunningApplication autorelease,
     the bot thread drains nothing by itself, and a night is thousands of bursts.
     """
-    with objc.autorelease_pool():
+    with _pool():
         return _burst_inner(pid, point, post, prev_app, hold)
 
 
@@ -1774,10 +1974,26 @@ FOCUS_GRACE = 2.0    # seconds after a focused start in which the hand leaving t
 POST_SLACK = 0.1     # seconds an event of the bot's own may register after its stamp
 
 
+def _send(ev) -> None:
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+
+
 def _post(ev) -> None:
     """Post one input event, and stamp when: every event the bot sends goes through here."""
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+    _send(ev)
     LAST_POST[0] = time.time()
+
+
+def _mouse_ev(kind: str, pt):
+    """A left-button 'move', 'down' or 'up' event at pt, for _post."""
+    kinds = {"move": Quartz.kCGEventMouseMoved, "down": Quartz.kCGEventLeftMouseDown,
+             "up": Quartz.kCGEventLeftMouseUp}
+    return Quartz.CGEventCreateMouseEvent(None, kinds[kind], pt, Quartz.kCGMouseButtonLeft)
+
+
+def _wheel_ev(dy: int):
+    """A wheel event, dy pixels: positive scrolls the content down (see scroll_at)."""
+    return Quartz.CGEventCreateScrollWheelEvent(None, Quartz.kCGScrollEventUnitPixel, 1, -int(dy))
 
 
 def _input_idle() -> float:
@@ -1796,8 +2012,8 @@ def _burst_inner(pid: int, point: Tuple[float, float], post, prev_app=None, hold
     if hold:
         # Already inside a held sequence: no activation, no handing focus back
         # between clicks. Three round trips per purchase is what lost the bargains.
-        pt = Quartz.CGPointMake(point[0], point[1])
-        Quartz.CGWarpMouseCursorPosition(pt)
+        pt = _point(point[0], point[1])
+        _warp(pt)
         deadline = time.time() + ACTIVATE_TIMEOUT
         while time.time() < deadline:
             if _topmost_pid_at((point[0], point[1]), ignore_pid=self_pid) == pid:
@@ -1811,16 +2027,14 @@ def _burst_inner(pid: int, point: Tuple[float, float], post, prev_app=None, hold
         # window under the click is Roblox itself, so nothing was ever handed back.
         front = _active_pid()
         if front is not None and front != pid:
-            prev = NSRunningApplication.runningApplicationWithProcessIdentifier_(front)
-    rb = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
-    cur = NSEvent.mouseLocation()
-    scr_h = Quartz.CGDisplayBounds(Quartz.CGMainDisplayID()).size.height
-    orig = Quartz.CGPointMake(cur.x, scr_h - cur.y)
-    pt = Quartz.CGPointMake(point[0], point[1])
+            prev = _app_for(front)
+    rb = _app_for(pid)
+    orig = _cursor_point()
+    pt = _point(point[0], point[1])
     if rb is not None:
-        rb.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+        _activate(rb)
     try:
-        Quartz.CGWarpMouseCursorPosition(pt)
+        _warp(pt)
         # macOS gives an inactive window's first click to the window itself, so a
         # click posted while Roblox is still coming forward is spent on focus and
         # the button never sees it. Waiting a fixed 0.25 s was a guess that lost
@@ -1842,20 +2056,15 @@ def _burst_inner(pid: int, point: Tuple[float, float], post, prev_app=None, hold
         return True
     finally:
         # even on Ctrl-C the cursor and the frontmost app go back where they were
-        Quartz.CGWarpMouseCursorPosition(orig)
+        _warp(orig)
         if prev is not None:
-            prev.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+            _activate(prev)
 
 
 def click_at(point: Tuple[float, float], pid: int, prev_app=None, hold: bool = False) -> bool:
     def post(pt):
-        for kind in (
-            Quartz.kCGEventMouseMoved,
-            Quartz.kCGEventLeftMouseDown,
-            Quartz.kCGEventLeftMouseUp,
-        ):
-            ev = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
-            _post(ev)
+        for kind in ("move", "down", "up"):
+            _post(_mouse_ev(kind, pt))
             time.sleep(CLICK_GAP)
 
     return _burst(pid, point, post, prev_app, hold)
@@ -1880,13 +2089,17 @@ def _press(keycode: int, char: Optional[str] = None, flags: int = 0) -> None:
     events are the cost (see FIELD_CLICK_GAP), not the sleeps.
     """
     for down in (True, False):
-        ev = Quartz.CGEventCreateKeyboardEvent(None, keycode, down)
-        if char is not None:
-            Quartz.CGEventKeyboardSetUnicodeString(ev, len(char), char)
-        if flags:
-            Quartz.CGEventSetFlags(ev, flags)
-        _post(ev)
+        _post(_key_ev(keycode, down, char, flags))
         time.sleep(KEY_HOLD if down else KEY_GAP)
+
+
+def _key_ev(keycode: int, down: bool, char: Optional[str] = None, flags: int = 0):
+    ev = Quartz.CGEventCreateKeyboardEvent(None, keycode, down)
+    if char is not None:
+        Quartz.CGEventKeyboardSetUnicodeString(ev, len(char), char)
+    if flags:
+        Quartz.CGEventSetFlags(ev, flags)
+    return ev
 
 
 def type_digits_at(
@@ -1929,13 +2142,8 @@ def type_digits_at(
         # events, and a down/up with no move before it does not land on the text box:
         # proved live, the same click focuses the field with a move and not without.
         time.sleep(FIELD_CLICK_GAP)
-        for kind in (
-            Quartz.kCGEventMouseMoved,
-            Quartz.kCGEventLeftMouseDown,
-            Quartz.kCGEventLeftMouseUp,
-        ):
-            ev = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
-            _post(ev)
+        for kind in ("move", "down", "up"):
+            _post(_mouse_ev(kind, pt))
             time.sleep(FIELD_CLICK_GAP)
         # let the field take focus before typing; longer when a digit comes first
         time.sleep(FIELD_FOCUS_WAIT if clear else FIRST_DIGIT_WAIT)
@@ -1964,10 +2172,7 @@ def type_digits_at(
 def scroll_at(point: Tuple[float, float], dy: int, pid: int, prev_app=None, hold: bool = False,
               notches: int = 1) -> bool:
     def post(pt):
-        ev = Quartz.CGEventCreateMouseEvent(
-            None, Quartz.kCGEventMouseMoved, pt, Quartz.kCGMouseButtonLeft
-        )
-        _post(ev)
+        _post(_mouse_ev("move", pt))
         time.sleep(CLICK_GAP)
         for i in range(max(1, notches)):
             if i:
@@ -1977,10 +2182,7 @@ def scroll_at(point: Tuple[float, float], dy: int, pid: int, prev_app=None, hold
                 x, y = _cursor_at()
                 if abs(x - pt.x) > 2 or abs(y - pt.y) > 2:
                     break
-            sc = Quartz.CGEventCreateScrollWheelEvent(
-                None, Quartz.kCGScrollEventUnitPixel, 1, -int(dy)
-            )
-            _post(sc)
+            _post(_wheel_ev(dy))
         time.sleep(CLICK_GAP)
 
     return _burst(pid, point, post, prev_app, hold)
@@ -1998,6 +2200,10 @@ def read_inventory() -> Optional[dict]:
         return None
     if not isinstance(snap, dict) or not isinstance(snap.get("items"), list):
         return None
+    for item in snap["items"]:
+        # snapshots from before fix_number still hold names like 'Charm Pack #T'
+        if isinstance(item, dict) and isinstance(item.get("name"), str):
+            item["name"] = fix_number(item["name"])
     return snap
 
 
@@ -2080,8 +2286,14 @@ def grid_shift(before: List[Line], after: List[Line], most: float) -> Optional[f
 
 
 def _serials_agree(a: Optional[str], b: Optional[str]) -> bool:
-    """Two reads of a serial that could be the same one: equal, truncated, or missing."""
-    return not a or not b or a.startswith(b) or b.startswith(a)
+    """Two reads of a serial that could be the same one: equal, truncated, or missing.
+
+    By digits, because Vision drops and swaps the punctuation: '#8982,700' and
+    '#8,982,700' are one crate, and comparing the text counted it twice in a scan
+    (infinite, 2026-10-02: three Case #1 for two).
+    """
+    da, db = _serial_digits(a), _serial_digits(b)
+    return not da or not db or da.startswith(db) or db.startswith(da)
 
 
 def same_serial(a: Optional[str], b: Optional[str]) -> bool:
@@ -2100,6 +2312,9 @@ def _serial_digits(serial: Optional[str]) -> str:
     return re.sub(r"\D", "", serial or "")
 
 
+# Words on the game's bottom bar (LOADOUT, INVENTORY, GAMEMODES, PLAY, SHOP, MARKET,
+# PROGRESSION), matched inside a line because Vision glues the icons on ('F LOADOUT').
+BOTTOM_BAR = ("LOADOUT", "INVENTORY", "GAMEMODES", "PROGRESSION")
 # The most crates one coin rise is booked as. The bot reads the coins every few
 # seconds, so more than this at once is more likely coins from something else.
 SURE_MIX = 3
@@ -2212,10 +2427,21 @@ MARKET_WHEEL_X = 0.93
 # Notches up that bring a scrolled purchase window back to its top: it scrolls at
 # most ~600 px, 3 notches at 2x, and more is harmless against the top.
 MODAL_UNSCROLL = 5
+# Cards that make two full rows of the market grid: with fewer there is no third row
+# to look at (Bot.peek_below).
+PEEK_MIN_CARDS = 10
 # Retries for a window capture that comes back empty even though the window is there.
 GRAB_TRIES = 5
 # Then how long to read the window's screen area instead before trying it again.
 REGION_SPELL = 60.0
+# What a refused window capture with no screen area either means, in words to act on.
+# macOS 26 asks the app that started the bot, again every so often, to "bypass the
+# system private window picker", on top of the Screen Recording list in Settings, and
+# blocks every capture until that prompt is answered (infinite, 2026-10-02: Terminal
+# on the list, the prompt up, and the log said only "Roblox window gone").
+CAPTURE_BLOCKED = (
+    "macOS is blocking screen capture. If it shows a prompt about Terminal recording your "
+    "screen, click Allow: being on the list in System Settings is not enough on its own")
 # How many purchases in a row may go unconfirmed before the bot stops itself. Losing
 # a listing to another buyer is ordinary, so this is a failsafe against a broken bot,
 # not a reaction to a normal miss.
@@ -2272,6 +2498,8 @@ class Bot:
         r"^QUALITY$",
         r"^PRICE FIELD$",
         r"^RECONNECT$",
+        r"^ACCEPT$",        # a trading server's rules
+        r"^SHOP ICON$",     # the trading hub's market icon, found by colour (find_hub_shop)
         r"^CATEGORY$",      # the SELL tab's dropdowns, relabelled: their text is whatever is picked
         r"^SORT$",
         r"^SORT ARROW$",
@@ -2360,6 +2588,8 @@ class Bot:
         self.topmost_at = _topmost_pid_at
         # Until when frames come from the screen area rather than the window (_grab).
         self._region_until = 0.0
+        self._capture_refused = False      # the window capture was refused outright
+        self._blocked_alerted = False      # the Mac has been told about this outage
         self.ocr = ocr
         self.click_at = click_at
         self.scroll_at = scroll_at
@@ -2370,6 +2600,7 @@ class Bot:
         self.sleep = time.sleep
         self.state_of = ui_state
         self._last_refresh = 0.0
+        self._peek_due = False      # rows below the first screen not yet looked at this refresh
         self._blocked: dict = {}
         self._unverified = 0
 
@@ -2397,7 +2628,7 @@ class Bot:
         if time.time() - self._last_heartbeat < HEARTBEAT_EVERY:
             return
         self._last_heartbeat = time.time()
-        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024.0 * 1024.0)
+        peak = _peak_mb()
         self.log(
             "peak memory %.0f MB after %d buys: clicks %d, history %d, parked %d"
             % (peak, self.bought, len(self.clicks), len(self.history), len(self._blocked))
@@ -2421,7 +2652,7 @@ class Bot:
         self.on_status(msg)
 
     def attach(self) -> None:
-        if not Quartz.CGPreflightScreenCaptureAccess():
+        if not WINDOWS and not Quartz.CGPreflightScreenCaptureAccess():
             # macOS asks for Screen Recording again now and then, and until it is
             # allowed every capture fails or hangs: a scan sat stuck for minutes
             # (infinite, 2026-09-30). So ask now, at Start, and stop with a reason.
@@ -2535,7 +2766,7 @@ class Bot:
         no runloop, so nothing drains the pool these frameworks autorelease into, and
         an overnight run grew by gigabytes until the process died.
         """
-        with objc.autorelease_pool():
+        with _pool():
             return self._read_frame()
 
     def _read_frame(self):
@@ -2556,11 +2787,17 @@ class Bot:
         # process was capturing the same window. One miss is not a missing window.
         img = self._grab()
         if img is None:
-            raise RuntimeError("Roblox window gone (capture returned nothing)")
+            if self._capture_refused and not self._blocked_alerted:
+                # once an outage: the run retries by itself, a person may have to act
+                self._blocked_alerted = True
+                notify(CAPTURE_BLOCKED)
+            raise RuntimeError(CAPTURE_BLOCKED if self._capture_refused
+                               else "Roblox window gone (capture returned nothing)")
+        self._blocked_alerted = False
         lines = self.ocr(img)
         lines = self._voted_counter(img, lines)
         if self.bounds and self.bounds["Width"]:
-            self.scale = Quartz.CGImageGetWidth(img) / float(self.bounds["Width"])
+            self.scale = img_size(img)[0] / float(self.bounds["Width"])
         af = find_text(lines, "APPLY FILTER")
         if af is not None:
             # Only the frames that read the whole label. Mid-countdown Vision returns
@@ -2581,12 +2818,14 @@ class Bot:
         the window's centre: otherwise the area shows somebody else's window.
         """
         if time.time() >= self._region_until:
+            self._capture_refused = False
             for _ in range(GRAB_TRIES):
                 GRAB_ERROR[0] = ""          # this try's answer, never an older one
                 img = self.grab(self.wid)
-                if img is not None and Quartz.CGImageGetWidth(img) > 0:
+                if img is not None and img_size(img)[0] > 0:
                     return img
                 if "could not create image" in GRAB_ERROR[0]:
+                    self._capture_refused = True
                     break           # refused outright, ~1 s a try: no use asking again
                 self.sleep(0.2)
             self.log("the Roblox window will not capture (%s): reading its screen area instead"
@@ -2597,7 +2836,7 @@ class Bot:
         if self.topmost_at(centre, ignore_pid=os.getpid()) != self.pid:
             return None
         img = self.grab_region(b)
-        return img if img is not None and Quartz.CGImageGetWidth(img) > 0 else None
+        return img if img is not None and img_size(img)[0] > 0 else None
 
     def _voted_counter(self, img, lines):
         """Replace the frame's coin-counter read with a majority vote (vote_counter).
@@ -2651,7 +2890,7 @@ class Bot:
         """
         if self._pill_box is None or not self._colour_only:
             return None
-        with objc.autorelease_pool():
+        with _pool():
             # Deliberately not assigning self.bounds: a full read owns that, and
             # quietly updating it here would swallow the move that bounds_moved
             # exists to announce, which is what stops a click going to a stale point.
@@ -2662,7 +2901,7 @@ class Bot:
             if bounds_differ(self.bounds, bounds):
                 return None
             img = self.grab(wid)
-            if img is None or Quartz.CGImageGetWidth(img) <= 0:
+            if img is None or img_size(img)[0] <= 0:
                 return None
             lit = bool(self.button_ready(img, self._pill_box))
             del img          # the 8 MB buffer goes now, inside the pool, not later
@@ -2797,6 +3036,7 @@ class Bot:
         if not self.click_line(af, "refresh listings"):
             return
         self._last_refresh = time.time()
+        self._peek_due = True
         deadline = time.time() + 20.0
         while time.time() < deadline and not self.stop_event.is_set():
             self.sleep(0.5)
@@ -2968,7 +3208,15 @@ class Bot:
                  and head.y + head.h <= l.y <= head.y + 4 * head.h]
         if below:
             return min(below, key=lambda l: l.y)
-        return Line("PRICE FIELD", 1.0, head.x, head.y + 2.55 * head.h, head.w, head.h)
+        y = head.y + 2.55 * head.h
+        # A number read in the box beside it (To's, for From) puts the row exactly:
+        # 2.55 is in Vision's label heights, and RapidOCR's (Windows) boxes are a third
+        # taller, which put the click at the box's bottom edge.
+        twins = [l for l in lines if l.x + l.w < col and re.match(r"^[\d,]+$", l.text.strip())
+                 and abs(l.cy - (y + head.h / 2)) < 1.5 * head.h]
+        if twins:
+            y = min(twins, key=lambda l: abs(l.cy - (y + head.h / 2))).cy - head.h / 2
+        return Line("PRICE FIELD", 1.0, head.x, y, head.w, head.h)
 
     def check_market_filter(self, lines) -> bool:
         """Restore the filter if it looks reset. True if it acted (the cycle ends).
@@ -3106,9 +3354,43 @@ class Bot:
         if not whole or not self.bounds:
             return SCROLL_NOTCHES
         reach = max(c.button_line.y + c.button_line.h - c.title_line.y for c in whole)
-        bottom = self.bounds["Height"] * self.scale * 0.97
-        need = card.title_line.y + reach - bottom
+        need = card.title_line.y + reach - self._view_bottom(lines)
         return max(1, min(8, int(math.ceil(need / (100.0 * self.scale))) + 1))
+
+    def peek_below(self, lines, balance) -> bool:
+        """Once a refresh, while the pill counts down: the rows under the first two.
+
+        infinite, 2026-10-09: twelve crates in the table now, so a refresh can fill a
+        third row, and no read of the first screen ever saw it. Two rows down, from
+        the grid's right edge (MARKET_WHEEL_X: never over the purchase window), a
+        look and a buy if one is there, then back to the top for the next refresh.
+        Only when two full rows of five show: fewer, and there is nothing below.
+        True when it went for a buy.
+        """
+        self._peek_due = False
+        cards = parse_cards(lines, 0)
+        tol = self._slot_tol()
+        rows: List[float] = []
+        for y in sorted(c.title_line.y for c in cards):
+            if not rows or y - rows[-1] > tol:
+                rows.append(y)
+        centre = self._grid_centre(lines)
+        if len(cards) < PEEK_MIN_CARDS or len(rows) < 2 or centre is None or not self.bounds:
+            return False
+        notches = max(1, int(round(2 * (rows[1] - rows[0]) / (100.0 * self.scale))))
+        pt = to_global(self.bounds, self.scale,
+                       replace(centre, x=self.bounds["Width"] * self.scale * MARKET_WHEEL_X))
+        if not self.wait_idle(self.s, self.stop_event):
+            return False
+        self.scroll_at(pt, SCROLL_STEP, self.pid, hold=self._hold, notches=notches)
+        self.sleep(SETTLE_AFTER_SCROLL)
+        try:
+            return self.try_buy(self._still_grid(), balance)
+        finally:
+            # back to the top whatever happened, so the next refresh shows row one
+            if self.wait_idle(self.s, self.stop_event):
+                self.scroll_at(pt, -SCROLL_STEP, self.pid, hold=self._hold, notches=notches + 3)
+                self.sleep(SETTLE_AFTER_SCROLL)
 
     def _scroll_to_button(self, lines, card) -> Optional[Card]:
         """Scroll the grid until the card's VIEW button is on screen, or give up.
@@ -3659,13 +3941,28 @@ class Bot:
                 % (balance, floor)
             )
 
-    def rejoin(self, state, lines) -> bool:
-        """Back to the market from a disconnect or the main menu. True if it acted.
+    def rejoin(self, state, lines, img=None) -> bool:
+        """Back to the market from a disconnect, a load or a menu. True if it acted.
 
         A dropped connection, a server restart and the AFK kick all end in Roblox's
-        Disconnected box. Reconnect lands on the main menu, and the next pass takes
-        MARKET from there, so a night survives any of them.
+        Disconnected box. Reconnect puts the game back where it was (infinite,
+        2026-10-07): the main game's main menu, where MARKET is on the bottom bar, or
+        a trading server, whose rules want ACCEPT and whose hub opens the market from
+        the golden shop icon. Both load through the game's orange loading screen.
         """
+        if state == "loading":
+            self.sleep(1.0)
+            return True
+        if state == "trade_rules":
+            btn = find_button(lines, "ACCEPT")
+            self.click_line(replace(btn, text="ACCEPT"), "accept the trade rules")
+            self.sleep(1.5)
+            return True
+        if state == "hub":
+            icon = find_hub_shop(img)
+            if icon is not None and self.click_line(icon, "open the market from the trading hub"):
+                self.wait_for(MARKET_STATES, 6.0)
+            return True
         if state == "disconnected":
             if time.time() - self._last_reconnect >= RECONNECT_EVERY:
                 self._last_reconnect = time.time()
@@ -3686,15 +3983,15 @@ class Bot:
         what brings the coins back.
         """
         try:
-            _, lines = self.read()
+            img, lines = self.read()
         except RuntimeError as exc:
             self.log("read failed while waiting: %s" % exc)
             self._wait_for_sales()
             return
         # the main menu has no wallet (its news date reads as a balance of 2026), and a
         # disconnect has none either: get back to the market before trusting a number
-        state = self.state_of(lines, None)
-        if self.rejoin(state, lines):
+        state = self.state_of(lines, img)
+        if self.rejoin(state, lines, img):
             return
         balance = parse_balance(lines)
         if state in MARKET_STATES:
@@ -3767,18 +4064,18 @@ class Bot:
             img, lines = self.read()
         # The exact label, the only thing click_line will press. The first line merely
         # containing it could be a news banner ("Market Update!") or a seller name.
-        tab = next((l for l in lines if l.text.strip().upper() == label.upper()), None)
+        tab = find_tab(lines, label)
         if tab is None:
             self.log("%s tab not visible" % label)
             return False
-        if not self.click_line(tab, "switch to %s" % label):
+        if not self.click_line(replace(tab, text=label), "switch to %s" % label):
             return False
         st, _, lines = self.wait_for(want, TAB_RETRY_AFTER)
         if st not in want:
             # A click that never landed leaves the screen as it was, tab and all.
             # Once more: pressing a tab that did open late does nothing.
-            again = next((l for l in lines if l.text.strip().upper() == label.upper()), None)
-            if again is not None and self.click_line(again, "switch to %s, again" % label):
+            again = find_tab(lines, label)
+            if again is not None and self.click_line(replace(again, text=label), "switch to %s, again" % label):
                 st, _, _ = self.wait_for(want, timeout)
         if st not in want:
             self.log("%s tab did not open (state %s)" % (label, st))
@@ -3786,7 +4083,7 @@ class Bot:
         return True
 
     def ensure_sell_view(self) -> bool:
-        """Miscellaneous, Newest, arrow up: the SELL grid set the way infinite uses it.
+        """Miscellaneous, Newest, arrow SELL_ARROW: the SELL grid set the way infinite uses it.
 
         Each dropdown hides the option already picked, so an option can only be looked
         for when something else is picked. Newest is required, because the regular
@@ -3812,13 +4109,13 @@ class Bot:
                 self.log("the sort did not change to Newest")
                 return False
         way, arrow = sort_direction(img, f["sort"], f["search"])
-        if way == "down" and self.click_line(arrow, "newest on top"):
+        if way is not None and way != SELL_ARROW and self.click_line(arrow, "sort arrow %s" % SELL_ARROW):
             self.sleep(0.6)
             img, lines = self.read()
             f = parse_sell_filters(lines)
             way, _ = sort_direction(img, f["sort"], f["search"])
-        if way != "up":
-            self.log("sort arrow reads %s, not up: newest may be at the bottom" % way)
+        if way != SELL_ARROW:
+            self.log("sort arrow reads %s, not %s: newest may not come first" % (way, SELL_ARROW))
         return True
 
     def pick_option(self, control: Line, label: str, option: str) -> bool:
@@ -3887,6 +4184,18 @@ class Bot:
         sa, sb = digits(a), digits(b)
         return bool(sa and sb and not (sa & sb))
 
+    def _view_bottom(self, lines) -> float:
+        """Where the grid's view ends, in capture px: the game's bottom bar, else the window.
+
+        Since 2026-10-07 the bar (LOADOUT .. PROGRESSION) sits over the bottom of the
+        market and SELL grids, and a button behind it is not on screen.
+        """
+        limit = self.bounds["Height"] * self.scale * 0.97
+        # the bar's own box starts about half a label above its text
+        bar = [l.y - 1.5 * l.h for l in lines
+               if l.y > limit * 0.6 and any(k in l.text.upper() for k in BOTTOM_BAR)]
+        return min([limit] + bar)
+
     def _page_notches(self, lines) -> int:
         """The biggest page that cannot carry a row past unseen, from this frame.
 
@@ -3899,7 +4208,7 @@ class Bot:
         if not whole or search is None or not self.bounds:
             return 1
         reach = max(c.button_line.y + c.button_line.h - c.title_line.y for c in whole)
-        view = self.bounds["Height"] * self.scale * 0.97 - (search.y + 3 * search.h)
+        view = self._view_bottom(lines) - (search.y + 3 * search.h)
         return max(1, min(PAGE_NOTCHES, int((view - reach) / (100.0 * self.scale))))
 
     def page_grid(self, lines, notches: int) -> Optional[list]:
@@ -3919,7 +4228,10 @@ class Bot:
             return None
         self._page_failed = False
         self.sleep(SETTLE_AFTER_SCROLL)
-        _, after = self.read()
+        # Settled, not the first frame: at either end Roblox bounces the grid, and a
+        # frame caught mid-bounce looked like movement, so the top was never "reached"
+        # and scans came out INCOMPLETE after paging the whole grid (2026-10-02).
+        after = self._still_grid()
         return after if self._grid_moved(lines, after) else None
 
     def scan_inventory(self) -> Optional[dict]:
@@ -4042,7 +4354,10 @@ class Bot:
                          if f["name"] == c.name and _overlap(f["title"], c.title_line) > 0
                          and abs(f["y"] - y) <= tol and _serials_agree(f["serial"], c.serial)), None)
             if same is None and c.serial:
-                same = next((f for f in found if f["name"] == c.name and f["serial"] == c.serial), None)
+                # out of its slot only the whole number will do: a truncated one would
+                # match every copy on a row
+                same = next((f for f in found if f["name"] == c.name
+                             and _serial_digits(f["serial"]) == _serial_digits(c.serial)), None)
             if same is None:
                 found.append({"name": c.name, "serial": c.serial, "button": c.button,
                               "case": c.is_case, "title": c.title_line, "y": y})
@@ -4179,12 +4494,15 @@ class Bot:
                     break
         lines = None
         refused = set()          # under the price floor: skipped, and never picked again
+        misses: Dict[str, int] = {}   # SELL NOW clicks that opened no price sheet, by serial
         paging = sweep
+        settle = True            # the grid was just scrolled, or the tab just opened
         while len(staged) < max(1, self.s.sell_batch_max):
             if self.stop_event.is_set():
                 break
-            if lines is None:
-                _, lines = self.read()
+            if lines is None or settle:
+                lines = self._still_grid(lines)
+                settle = False
             done = {c["serial"] for c in staged} | refused
             waiting = [
                 c
@@ -4208,7 +4526,7 @@ class Bot:
                 if nxt is None:
                     break
                 pages += 1
-                lines = nxt          # page_grid already read it: no second capture
+                lines = nxt          # page_grid waited for it to settle
                 continue
             # higher in the crate table lists first; the grid's own order within one crate
             card = min(waiting, key=lambda c: crate_rank(c.name, self.s))
@@ -4227,12 +4545,24 @@ class Bot:
                 staged.append({"serial": card.serial, "name": card.name, "price": price})
                 continue
             if not self.stage_one(card, price):
+                _, lines = self.read()
+                state = self.state_of(lines, None)
+                if state == "sell" and sum(misses.values()) < SELL_MISSES:
+                    # Back on the grid with nothing open: the click missed, or the sheet
+                    # was backed out of. Ending the trip on that ended whole sweeps
+                    # (infinite, 2026-10-02). Look again; a crate missed twice waits
+                    # for the next trip.
+                    misses[card.serial] = misses.get(card.serial, 0) + 1
+                    if misses[card.serial] >= 2:
+                        refused.add(card.serial)
+                    self.log("%s %s did not stage, looking again" % (card.name, card.serial))
+                    lines, settle = None, True
+                    continue
                 # Whatever is already in the basket is ours and correctly priced, so
                 # stop adding and sell those rather than abandoning them: a basket
                 # left full blocks every later batch.
                 self.log("could not stage %s, selling what is already in" % card.name)
-                _, lines = self.read()
-                if self.state_of(lines, None) == "setprice":
+                if state == "setprice":
                     self.cancel_setprice(lines)
                 break
             staged.append({"serial": card.serial, "name": card.name, "price": price})
@@ -4289,12 +4619,27 @@ class Bot:
             if i:
                 self.sleep(0.3)
             img, lines = self.read()
-            got = parse_basket(lines)
-            if got is not None and sorted(got) == want:
+            rows = basket_rows(lines)
+            got = [p if p is not None else self._row_price(img, head) for head, p in rows] or None
+            if got is not None and None not in got and sorted(got) == want:
                 return lines
         self.log("REFUSED to sell the basket: it reads %s, the crates were typed at %s, "
                  "taking them back out to list again next trip" % (got, want))
         self.bail_out(None, img)        # keeps the frame in failures/
+        return None
+
+    @staticmethod
+    def _row_price(img, head: Line) -> Optional[int]:
+        """A basket price the frame's read missed, from its own box at a few scales."""
+        if img is None:
+            return None
+        box = (head.x - head.w * 0.5, head.y + head.h, head.x + head.w * 2.5, head.y + head.h * 4)
+        for k in (1.0, 2.0, 0.5):
+            crop = _scaled_crop(img, box, k)
+            digits = [l.text.strip() for l in ocr(crop)] if crop is not None else []
+            digits = [d for d in digits if PRICE_RE.match(d)]
+            if digits:
+                return int(digits[0])
         return None
 
     def _empty_basket(self) -> None:
@@ -4318,6 +4663,24 @@ class Bot:
                 break
             self.sleep(0.5)
         self.log("the sell basket would not empty, it needs clearing by hand")
+
+    def _still_grid(self, lines=None):
+        """A frame of the grid once it has stopped moving: two reads in a row agree.
+
+        A scroll, and the bounce Roblox puts on a scroll past either end, keeps the
+        grid gliding for a moment after the wheel stops, and a button read off a
+        moving grid is clicked where it was: a sweep's SELL NOW landed beside its
+        button and the sweep ended there (infinite, 2026-10-02).
+        """
+        if lines is None:
+            _, lines = self.read()
+        for _ in range(STILL_READS):
+            self.sleep(STILL_GAP)
+            _, now = self.read()
+            if not self._grid_moved(lines, now):
+                return now
+            lines = now
+        return lines
 
     def confirm_listed(self, staged) -> int:
         """Poll until the staged crates read DELIST with an empty basket."""
@@ -4729,7 +5092,7 @@ class Bot:
                 self.sleep(0.6)
             self.goto_tab("MARKET", ("market_ready", "market_nofilter", "cooldown"))
             return
-        if self.rejoin(state, lines):
+        if self.rejoin(state, lines, img):
             self._unknown_frames = 0
             return
         if state in ("market_ready", "cooldown", "market_nofilter", "sell"):
@@ -4751,9 +5114,12 @@ class Bot:
             if state == "market_ready":
                 self.refresh(lines)
             else:
-                # counting down. A full read every pass is what lets a bargain listed
-                # mid-countdown be caught, so the OCR pass still comes round about
-                # once a second; in between, the pill is watched by colour alone.
+                # counting down: once a refresh, the rows under the first screen
+                if self._peek_due and self.peek_below(lines, balance):
+                    return
+                # A full read every pass is what lets a bargain listed mid-countdown
+                # be caught, so the OCR pass still comes round about once a second;
+                # in between, the pill is watched by colour alone.
                 self.cooldown_wait()
             return
         # Nothing readable. Most often a transient frame, but it is also what an AFK
@@ -4921,7 +5287,7 @@ def report(lines, img, s: Settings) -> None:
     print("balance: %s" % parse_balance(lines))
     af = find_text(lines, "APPLY FILTER")
     print("apply filter: %s" % (("%r at x=%.0f y=%.0f" % (af.text, af.cx, af.cy)) if af else "not readable"))
-    cards = parse_cards(lines, Quartz.CGImageGetWidth(img) if img is not None else 0)
+    cards = parse_cards(lines, img_size(img)[0] if img is not None else 0)
     print("cards: %d" % len(cards))
     for c in cards:
         buy, why = decide(c, s)
@@ -4957,7 +5323,7 @@ def main(argv=None) -> int:
 
     if args.parse:
         img = load_png(args.parse)
-        print("%s  %dx%d  brightness=%.1f" % (args.parse, Quartz.CGImageGetWidth(img), Quartz.CGImageGetHeight(img), mean_brightness(img)))
+        print("%s  %dx%d  brightness=%.1f" % ((args.parse,) + img_size(img) + (mean_brightness(img),)))
         report(ocr(img), img, s)
         return 0
 
@@ -4965,8 +5331,8 @@ def main(argv=None) -> int:
         pid, wid, b = find_roblox()
         print("roblox pid=%s window=%s bounds=%s" % (pid, wid, b))
         img = grab(wid)
-        W = Quartz.CGImageGetWidth(img)
-        print("capture %dx%d scale=%.2f brightness=%.1f" % (W, Quartz.CGImageGetHeight(img), W / b["Width"], mean_brightness(img)))
+        W, H = img_size(img)
+        print("capture %dx%d scale=%.2f brightness=%.1f" % (W, H, W / b["Width"], mean_brightness(img)))
         report(ocr(img), img, s)
         return 0
 
@@ -5008,6 +5374,26 @@ def main(argv=None) -> int:
 
     ap.print_help()
     return 1
+
+
+# --------------------------------------------------------------------------- windows
+
+
+if WINDOWS:
+    # The same bot on Windows: winplat.py stands in for every macOS call above.
+    from winplat import (  # noqa: F401  (rebinds the macOS versions)
+        GRAB_ERROR, find_roblox, grab, grab_region, notify, load_png, save_png, img_size,
+        _sample, _luma_grid, _rgb_grid, _scaled_crop, _session_idle, _input_idle, _peak_mb,
+        _topmost_pid_at, _active_pid, _cursor_at, _cursor_point,
+        _app_for, _activate, _point, _warp, _send, _mouse_ev, _wheel_ev, _key_ev,
+        DIGIT_KEYS, KEY_A, KEY_DELETE, KEY_RIGHT, read_text,
+    )
+
+    def ocr(img) -> List[Line]:
+        """RapidOCR in place of Vision (winplat.read_text), as the same Lines."""
+        out = [Line(t.translate(_LATIN), c, x, y, w, h) for t, c, x, y, w, h in read_text(img)]
+        out.sort(key=lambda l: (l.y, l.x))
+        return out
 
 
 if __name__ == "__main__":

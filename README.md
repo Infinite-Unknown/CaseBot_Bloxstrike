@@ -1,24 +1,83 @@
 # CaseBot (Bloxstrike)
 
-A Mac helper for the skin market in the Roblox game Bloxstrike. It watches the market,
-buys crates at or under the prices you set, and lists them again at your sell prices.
+A helper for the skin market in the Roblox game Bloxstrike, for **Mac and Windows**. It
+watches the market, buys crates at or under the prices you set, and lists them again at your
+sell prices.
 
-It sees the game with the Mac's built-in text recognition (Apple Vision) and clicks the way
-a person would. It only ever trades **cases**: knives, guns and gloves are never bought or
-sold.
+It reads the game's text off the screen (Apple Vision on a Mac, RapidOCR on Windows) and
+clicks the way a person would. It only ever trades **cases**: knives, guns and gloves are
+never bought or sold.
+
+> **Windows is new.** It is the same bot, but its clicks, typing and screen capture have not
+> been tried on a Windows PC yet. Start with **Dry run** on, and if something goes wrong,
+> send the log and the newest picture in `failures/`.
 
 > **Warning:** automating a game client can break the game's rules and get your account
 > banned, and it spends real in-game coins. Leave **Dry run** on until you trust your
 > settings. Use it at your own risk.
 
-## What you need
+## Windows
+
+### What you need
+
+- Windows 10 or 11, 64-bit.
+- [uv](https://docs.astral.sh/uv/), which also fetches the right Python for you. Open
+  **PowerShell** and run:
+
+  ```powershell
+  powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+  ```
+
+  Then close PowerShell and open it again.
+- Roblox in a window (maximised is fine), not minimised. A screen of its own is best.
+
+### Install
+
+Download the bot: on this page press **Code > Download ZIP**, and unzip it. Or, with git:
+
+```powershell
+git clone https://github.com/Infinite-Unknown/CaseBot_Bloxstrike.git
+```
+
+Then, in PowerShell:
+
+```powershell
+cd CaseBot_Bloxstrike
+uv venv --python 3.12
+uv pip install -r requirements.txt
+```
+
+`cd` into the folder you unzipped if you used the ZIP (its name ends in `-main`). The install is
+about 150 MB, most of it the text reader.
+
+### Start it
+
+1. Open Bloxstrike in Roblox and go to the **MARKET** tab.
+2. In PowerShell, in the bot's folder:
+
+   ```powershell
+   .venv\Scripts\python app.py
+   ```
+
+   It keeps the PC and its screen awake while it is open.
+3. Carry on from step 3 of the Mac's "Start it" below: set your crate prices, then Start.
+
+Windows needs no permissions. Two things to know:
+
+- If Roblox runs **as administrator**, Windows blocks the bot's clicks. Run both normally.
+- Reading the screen takes about 1 second a frame on Windows (a fraction of that on a Mac),
+  so the bot is a little slower to spot a cheap crate.
+
+## Mac
+
+### What you need
 
 - A Mac. It was built and tested on macOS 26 with Apple Silicon.
 - Python 3.12 with Tk. The easiest way is [uv](https://docs.astral.sh/uv/) (`brew install uv`)
   or the python.org installer. Homebrew's own Python also needs `brew install python-tk@3.12`.
 - Roblox running **in a window**, not full screen, best on a screen of its own.
 
-## Install
+### Install
 
 ```bash
 git clone https://github.com/Infinite-Unknown/CaseBot_Bloxstrike.git
@@ -34,7 +93,7 @@ python3.12 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-## Allow it to see and click
+### Allow it to see and click
 
 macOS gives these permissions to the app you start the bot from (Terminal, iTerm, and so on).
 Open **System Settings > Privacy & Security** and turn your terminal on under:
@@ -46,7 +105,7 @@ macOS asks again from time to time. If Start says it is not allowed to record th
 click **Allow** in the prompt and press Start again. Right after allowing, screen captures can
 be slow for a few minutes. That passes on its own.
 
-## Start it
+### Start it
 
 1. Open Bloxstrike in Roblox, in a window, and go to the **MARKET** tab.
 2. Start the bot:
@@ -103,8 +162,11 @@ again without pressing PURCHASE, and the log says what it would have bought.
   reads every price back from the basket. A wrong price is taken out, never sold.
 - Never lists a crate for less than it pays for it, after the tax.
 - When coins run out and relisting is on, it lists everything sellable and waits for sales.
+- Looks past the first screen of the market too: once a refresh, it scrolls down to the third
+  row of cards while the refresh button counts down.
 - Gets back on its own: it presses MARKET from the main menu, presses Reconnect after a
-  disconnect, and puts the market filter back.
+  disconnect, and puts the market filter back. In a trading server it accepts the trade
+  rules and opens the market from the gold shop icon at the bottom left.
 - Works out which listings sold from how much your coins went up. When it cannot tell, it
   scans your inventory again.
 
@@ -128,11 +190,16 @@ All in the bot's folder, and all left out of git:
 .venv/bin/python app.py --autostart      # open the window and press Start right away
 ```
 
+On Windows, write `.venv\Scripts\python` in place of `.venv/bin/python`.
+
 ## Problems
 
-- **"Roblox window not found"**: Roblox has to run in a window, not full screen.
-- **Start says it cannot record the screen**: see "Allow it to see and click" above.
-- **Clicks do nothing**: turn on Accessibility for your terminal.
+- **"Roblox window not found"**: Roblox has to run in a window, not full screen (Mac), and
+  not minimised (Windows).
+- **Start says it cannot record the screen** (Mac): see "Allow it to see and click" above.
+- **Clicks do nothing**: on a Mac, turn on Accessibility for your terminal. On Windows,
+  check Roblox is not running as administrator.
+- **`uv` is not recognised** (Windows): close PowerShell and open a new one after installing uv.
 - **Anything else**: read the log on the Dashboard, and look in `failures/` for a screenshot
   of what the bot saw.
 

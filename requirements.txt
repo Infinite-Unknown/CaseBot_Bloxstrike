@@ -1,3 +1,9 @@
-pyobjc-framework-Cocoa>=12
-pyobjc-framework-Quartz>=12
-pyobjc-framework-Vision>=12
+# Mac: Apple's own text recognition and input, through PyObjC
+pyobjc-framework-Cocoa>=12; sys_platform == "darwin"
+pyobjc-framework-Quartz>=12; sys_platform == "darwin"
+pyobjc-framework-Vision>=12; sys_platform == "darwin"
+# Windows: RapidOCR reads the text (its models come inside the package)
+rapidocr>=3.4; sys_platform == "win32"
+onnxruntime>=1.20; sys_platform == "win32"
+pillow>=10; sys_platform == "win32"
+numpy>=1.24; sys_platform == "win32"
