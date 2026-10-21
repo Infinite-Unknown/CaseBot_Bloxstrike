@@ -11,6 +11,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -44,6 +45,8 @@ SETTINGS_PATH = os.path.join(HERE, "settings.json")
 CONFIGS_DIR = os.path.join(HERE, "configs")
 ACTIVE_CONFIG_PATH = os.path.join(CONFIGS_DIR, "active.txt")
 DEFAULT_CONFIG = "default"
+# infinite's own settings, shipped: a fresh download starts from these (dry run on).
+STARTER_PATH = os.path.join(HERE, "starter_config.json")
 PURCHASES_PATH = os.path.join(HERE, "purchases.jsonl")
 FAILURES_DIR = os.path.join(HERE, "failures")
 LOG_PATH = os.path.join(HERE, "casebot.log")
@@ -303,9 +306,15 @@ class Settings:
         try:
             with open(path) as fh:
                 raw = json.load(fh)
-        except (OSError, ValueError):
+        except OSError:
             return Settings()
+        except ValueError:
+            raw = None
         if not isinstance(raw, dict):
+            # Unreadable (a hand edit gone wrong): kept aside before anything can save
+            # defaults over it, which would lose the whole crate table.
+            with contextlib.suppress(OSError):
+                shutil.copyfile(path, path + ".bad")
             return Settings()
         known = {f for f in Settings.__dataclass_fields__}
         s = Settings(**{k: v for k, v in raw.items() if k in known})
@@ -319,9 +328,11 @@ class Settings:
         path = path or config_path(active_config())
         os.makedirs(os.path.dirname(path), exist_ok=True)
         data = {k: v for k, v in asdict(self).items() if k not in TIER_FIELDS}
-        with open(path, "w") as fh:
+        # through a temp file: a crash mid-write never leaves a config cut short
+        with open(path + ".tmp", "w") as fh:
             json.dump(data, fh, indent=2)
             fh.write("\n")
+        os.replace(path + ".tmp", path)
 
 
 # --------------------------------------------------------------------------- configs
@@ -339,10 +350,15 @@ def config_path(name: str) -> str:
 
 
 def _migrate_settings() -> None:
-    """settings.json from before configs\\ becomes configs\\default.json, once."""
+    """With no config yet: settings.json from before configs\\ moves in as default.json,
+    else a fresh download starts from the shipped starter_config.json."""
     os.makedirs(CONFIGS_DIR, exist_ok=True)
-    if os.path.exists(SETTINGS_PATH) and not list_configs():
+    if list_configs():
+        return
+    if os.path.exists(SETTINGS_PATH):
         os.replace(SETTINGS_PATH, config_path(DEFAULT_CONFIG))
+    elif os.path.exists(STARTER_PATH):
+        shutil.copyfile(STARTER_PATH, config_path(DEFAULT_CONFIG))
 
 
 def list_configs() -> List[str]:
@@ -363,8 +379,11 @@ def active_config() -> str:
     except OSError:
         name = ""
     have = list_configs()
-    if name in have:
-        return name
+    # by name whatever the case: Mac and Windows file names ignore it, so 'night'
+    # may be saved over Night.json, which keeps its own spelling
+    for n in have:
+        if n.lower() == name.lower():
+            return n
     return DEFAULT_CONFIG if DEFAULT_CONFIG in have or not have else have[0]
 
 
@@ -5395,9 +5414,13 @@ def main(argv=None) -> int:
         help="type into the market search box to see which keystroke style Roblox takes",
     )
     args = ap.parse_args(argv)
-    if args.config and args.config not in list_configs():
-        print("no config %r in %s: have %s" % (args.config, CONFIGS_DIR, ", ".join(list_configs())))
-        return 1
+    active_config()         # an old settings.json moves in first, so it can be named
+    if args.config:
+        match = next((n for n in list_configs() if n.lower() == args.config.lower()), None)
+        if match is None:
+            print("no config %r in %s: have %s" % (args.config, CONFIGS_DIR, ", ".join(list_configs())))
+            return 1
+        args.config = match
     s = Settings.load(config_path(args.config) if args.config else None)
 
     if args.parse:

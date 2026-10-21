@@ -198,6 +198,7 @@ class App:
         self.settings = settings or cb.Settings.load()
         # Each Ignore box's grey-out, rerun when a config is loaded into the window.
         self._greys = []
+        self._ranges = {}       # each slider's own range, widened per config to hold its value
         self.bot = None
         # The run that last finished, so its numbers stay on the dashboard.
         self.last_bot = None
@@ -416,8 +417,9 @@ class App:
         configs.grid(columnspan=2, sticky="ew")
         ttk.Label(configs, text="Config").grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.config_var = tk.StringVar(master=self.root, value=self.config_name)
-        self.config_box = ttk.Combobox(configs, textvariable=self.config_var, state="readonly", width=24,
-                                       values=cb.list_configs() or [self.config_name])
+        # guarded like every other box: a wheel or trackpad pass over it switched configs
+        self.config_box = no_nudge(ttk.Combobox(configs, textvariable=self.config_var, state="readonly",
+                                                width=24, values=cb.list_configs() or [self.config_name]))
         self.config_box.grid(row=0, column=1, sticky="w")
         self.config_box.bind("<<ComboboxSelected>>", lambda e: self._switch_config(self.config_var.get()))
         for c, (text, command) in enumerate((
@@ -666,6 +668,7 @@ class App:
         value = getattr(self.settings, key)
         kind = tk.DoubleVar if isinstance(getattr(DEFAULTS, key), float) else tk.IntVar
         var = self.vars[key] = kind(master=self.root, value=value)
+        self._ranges[key] = (lo, hi)
         # A range that holds the saved value, or the scale would quietly clamp it.
         scale = tk.Scale(tab, variable=var, from_=min(lo, value), to=max(hi, value), resolution=step,
                          orient="horizontal", length=260, showvalue=True, highlightthickness=0)
@@ -801,7 +804,7 @@ class App:
     # -- configs: named settings files in configs\
 
     def _title(self):
-        self.root.title("casebot — %s" % self.config_name)
+        self.root.title("casebot: %s" % self.config_name)
         self.save_note.set("Saves to %s. A running bot keeps the settings it started with."
                            % os.path.join("configs", self.config_name + ".json"))
 
@@ -812,7 +815,13 @@ class App:
 
     def _unsaved(self) -> bool:
         """True when the window holds edits its config's file does not."""
-        return asdict(self.collect(quiet=True)) != self._saved_view
+        return self._view() != self._saved_view
+
+    def _view(self):
+        # the crate order too: asdict compares dicts without it, and a dragged
+        # priority was dropped on a switch with no prompt
+        s = self.collect(quiet=True)
+        return asdict(s), list(s.crates)
 
     def _ask_save_first(self, doing: str) -> bool:
         """Offer to save unsaved edits before they are dropped. False: the person cancelled."""
@@ -835,6 +844,12 @@ class App:
             value = getattr(s, key)
             if key == "filter_rarity":
                 value = value or ANY
+            if key in self._ranges:
+                # widen first, or the Scale clamps a value outside the startup config's range
+                lo, hi = self._ranges[key]
+                self.widgets[key].configure(from_=min(lo, value), to=max(hi, value))
+            if isinstance(var, tk.BooleanVar):
+                value = bool(value)
             var.set(value if isinstance(var, (tk.BooleanVar, tk.IntVar, tk.DoubleVar)) else str(value))
         for grey in self._greys:
             grey()
@@ -851,7 +866,7 @@ class App:
     def _mark_saved(self) -> None:
         # What the window reads as now, the yardstick for _unsaved: comparing with the
         # file itself flagged a fresh load, whose crate rows read back with an "on" added.
-        self._saved_view = asdict(self.collect(quiet=True))
+        self._saved_view = self._view()
 
     def _switch_config(self, name: str) -> None:
         if name == self.config_name:
@@ -877,10 +892,12 @@ class App:
         if refused:
             messagebox.showerror("Save as new config", refused, parent=self.root)
             return
-        if any(n.lower() == name.lower() for n in cb.list_configs()) and not messagebox.askyesno(
-                "Save as new config", "A config called %s exists. Replace it?" % name, parent=self.root):
+        same = next((n for n in cb.list_configs() if n.lower() == name.lower()), None)
+        if same is not None and not messagebox.askyesno(
+                "Save as new config", "A config called %s exists. Replace it?" % same, parent=self.root):
             return
-        self.config_name = name
+        # the file keeps its own spelling on a Mac or Windows disk, so the name does too
+        self.config_name = same or name
         self.save()
         self._say("saved as new config %s, now in use" % name)
 
@@ -890,7 +907,7 @@ class App:
         self._say("config %s reloaded from its file" % self.config_name)
 
     def _delete_config(self) -> None:
-        others = [n for n in cb.list_configs() if n != self.config_name]
+        others = [n for n in cb.list_configs() if n.lower() != self.config_name.lower()]
         if not others:
             messagebox.showinfo("Delete config", "This is the only config: make another with "
                                 "Save as new first.", parent=self.root)
@@ -1262,6 +1279,8 @@ class App:
             self.overlay = None
 
     def _quit(self):
+        if not self._ask_save_first("closing"):
+            return
         for bot in (self.bot, self.scan_bot):
             if bot is not None:
                 bot.stop()

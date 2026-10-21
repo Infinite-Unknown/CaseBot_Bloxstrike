@@ -1,0 +1,72 @@
+{
+  "crates": {
+    "Case #1": {
+      "buy": 205,
+      "sell": 299
+    },
+    "Halloween 2026": {
+      "buy": 60,
+      "sell": 80
+    },
+    "Hero of Hell Console": {
+      "buy": 75,
+      "sell": null
+    },
+    "Anime Case": {
+      "buy": 36,
+      "sell": 39
+    },
+    "Apex Case": {
+      "buy": 36,
+      "sell": 39
+    },
+    "Chrysalis": {
+      "buy": 36,
+      "sell": 39
+    },
+    "Lionheart": {
+      "buy": 36,
+      "sell": 39
+    },
+    "Glove Case 2": {
+      "buy": 36,
+      "sell": 39
+    },
+    "Finishline Case": {
+      "buy": 36,
+      "sell": 39
+    },
+    "Glove Case": {
+      "buy": 36,
+      "sell": 39
+    },
+    "Viridian Case": {
+      "buy": 54,
+      "sell": 58
+    },
+    "Nebula Case": {
+      "buy": 54,
+      "sell": 58
+    },
+    "Charm Pack #1": {
+      "buy": 12,
+      "sell": 14
+    }
+  },
+  "cases_only": true,
+  "dynamic_purchases": true,
+  "dynamic_spend": true,
+  "auto_sell": true,
+  "sell_tax": 0.05,
+  "sell_batch_size": 2,
+  "sell_batch_max": 5,
+  "idle_seconds": 3.0,
+  "dry_run": true,
+  "max_purchases": 999,
+  "max_spend": 84,
+  "refresh_cooldown": 2.0,
+  "filter_price_max": 250,
+  "filter_rarity": "Red",
+  "restore_filter": true,
+  "focus_mode": true
+}

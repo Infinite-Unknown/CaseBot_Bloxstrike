@@ -54,7 +54,7 @@ about 150 MB, most of it the text reader.
 and it now runs on your graphics card. Swap it over once, in the bot's folder:
 
 ```powershell
-uv pip uninstall onnxruntime
+uv pip uninstall onnxruntime onnxruntime-directml
 uv pip install -r requirements.txt
 ```
 
@@ -193,6 +193,7 @@ All in the bot's folder, and all left out of git:
 | File | What it holds |
 | --- | --- |
 | `configs/` | one `.json` per config, written when you press Save, and `active.txt`, the one in use. An old `settings.json` moves in as `configs/default.json` the first time it starts |
+| `starter_config.json` | the settings a fresh download starts from (Dry run on), copied in as `configs/default.json` the first time it starts. Shipped with the bot, not written by it |
 | `purchases.jsonl` | every buy, listing and sale |
 | `casebot.log` | everything it did |
 | `inventory.json` | the last inventory scan |
