@@ -953,6 +953,18 @@ def find_confirm(lines: List[Line]) -> Optional[Line]:
     return find_button(lines, "CONFI", avoid="PURCHASE")
 
 
+def _tab_word(text: str) -> Optional[str]:
+    """A top-bar label's word, its icon read alongside or not: 'MARKET G', 'SELL¥', 'PROFILE 2'.
+
+    None when anything else on the line is a word of its own: 'SELL ITEMS' is the
+    basket's button, not the tab.
+    """
+    m = re.match(r"\s*([A-Za-z]+)(.*)$", text or "")
+    if m is None or re.search(r"[A-Za-z]{2,}", m.group(2)):
+        return None
+    return m.group(1).upper()
+
+
 def find_tab(lines: List[Line], label: str) -> Optional[Line]:
     """The MARKET or SELL tab to click: on the top bar, beside PROFILE.
 
@@ -963,9 +975,8 @@ def find_tab(lines: List[Line], label: str) -> Optional[Line]:
     the way in.
     """
     want = label.upper()
-    named = [l for l in lines
-             if l.text.strip().upper() == want or l.text.strip().upper().startswith(want + " ")]
-    profiles = [l for l in lines if l.text.strip().upper() == "PROFILE"]
+    named = [l for l in lines if _tab_word(l.text) == want]
+    profiles = [l for l in lines if _tab_word(l.text) == "PROFILE"]
     if profiles:
         p = min(profiles, key=lambda l: l.y)
         named = [l for l in named if abs(l.cy - p.cy) < 1.5 * p.h]
@@ -1041,10 +1052,12 @@ def parse_sell_filters(lines: List[Line]) -> dict:
     out = {"category": None, "sort": None, "search": search}
     if search is None:
         return out
+    # Each dropdown's chevron may come with its label, as a symbol or a lone letter
+    # ('Newest ^', 'Quality v'): only the words count.
     row = sorted(
-        (l for l in lines
+        (replace(l, text=re.sub(r"(\s+[A-Za-z])+$", "", m.group(1).strip())) for l in lines
          if abs(l.cy - search.cy) < search.h and l.x < search.x
-         and re.match(r"^[A-Za-z][A-Za-z ]{2,}$", l.text.strip())),
+         for m in [re.match(r"^([A-Za-z][A-Za-z ]{2,}?)[\s\W\d_]*$", l.text.strip())] if m),
         key=lambda l: l.x,
     )
     sorts = [l for l in row if l.text.strip().lower() in SORT_OPTIONS]
@@ -1061,6 +1074,8 @@ def parse_sell_filters(lines: List[Line]) -> dict:
 # first screen. infinite, 2026-10-02: "I think we have been using the wrong
 # direction", so down. If newest turns out to be at the bottom after all, flip it.
 SELL_ARROW = "down"
+# Extra frames, 0.7 s apart, to find the sort control on a SELL tab still drawing.
+SORT_RETRIES = 4
 
 
 def sort_direction(img, sort: Optional[Line], search: Optional[Line]):
@@ -4164,7 +4179,9 @@ class Bot:
         # containing it could be a news banner ("Market Update!") or a seller name.
         tab = find_tab(lines, label)
         if tab is None:
-            self.log("%s tab not visible" % label)
+            self.log("%s tab not visible (top of the screen read: %s)" % (
+                label, ", ".join(repr(l.text) for l in lines if l.y < img_size(img)[1] * 0.12)))
+            self.keep_frame(img, "no-%s-tab" % label.lower())
             return False
         if not self.click_line(replace(tab, text=label), "switch to %s" % label):
             return False
@@ -4177,6 +4194,7 @@ class Bot:
                 st, _, _ = self.wait_for(want, timeout)
         if st not in want:
             self.log("%s tab did not open (state %s)" % (label, st))
+            self.keep_frame(self.read()[0], "%s-tab-did-not-open" % label.lower())
             return False
         return True
 
@@ -4195,8 +4213,18 @@ class Bot:
             self.pick_option(cat, "CATEGORY", "Miscellaneous")
             img, lines = self.read()
             f = parse_sell_filters(lines)
+        for _ in range(SORT_RETRIES):
+            if f["sort"] is not None:
+                break
+            # A big inventory can still be drawing its filter row when the tab opens:
+            # one frame was all it got, and the whole trip failed on it.
+            self.sleep(0.7)
+            img, lines = self.read()
+            f = parse_sell_filters(lines)
         if f["sort"] is None:
-            self.log("sort control not found on the sell tab")
+            self.log("sort control not found on the sell tab (read: %s)"
+                     % ", ".join(repr(l.text) for l in lines if l.y < img_size(img)[1] * 0.25))
+            self.keep_frame(img, "no-sort-control")
             return False
         if f["sort"].text.strip().lower() != "newest":
             if not self.pick_option(f["sort"], "SORT", "Newest"):
@@ -4205,6 +4233,7 @@ class Bot:
             f = parse_sell_filters(lines)
             if f["sort"] is None or f["sort"].text.strip().lower() != "newest":
                 self.log("the sort did not change to Newest")
+                self.keep_frame(img, "sort-not-newest")
                 return False
         way, arrow = sort_direction(img, f["sort"], f["search"])
         if way is not None and way != SELL_ARROW and self.click_line(arrow, "sort arrow %s" % SELL_ARROW):
@@ -5087,6 +5116,23 @@ class Bot:
         except OSError as exc:
             self.log("could not write purchases.jsonl: %s" % exc)
 
+    def keep_frame(self, img, why: str) -> None:
+        """Save a frame the bot could not make sense of to failures/, at most one a minute.
+
+        Not finding a tab or the sort control saved nothing, so a friend's report came
+        with a log and no picture of what the bot had seen.
+        """
+        if img is None or time.time() - getattr(self, "_kept_at", 0.0) < 60:
+            return
+        self._kept_at = time.time()
+        path = os.path.join(FAILURES_DIR, "%s-%s.png" % (time.strftime("%Y%m%d-%H%M%S"), why))
+        try:
+            save_png(img, path)
+            prune_failures()
+            self.log("saved what it saw to %s" % path)
+        except (OSError, RuntimeError) as exc:
+            self.log("could not save %s: %s" % (path, exc))
+
     def bail_out(self, lines, img) -> None:
         if img is not None:
             save_png(
@@ -5298,6 +5344,8 @@ class Bot:
         self.attach()
         self.begin()
         self.log("running (dry_run=%s)" % self.s.dry_run)
+        if WINDOWS:
+            self.log("text reader: %s" % ocr_engine())
         while not self.stop_event.is_set() and not self.done():
             try:
                 self.cycle()
@@ -5492,12 +5540,21 @@ if WINDOWS:
         _sample, _luma_grid, _rgb_grid, _scaled_crop, _session_idle, _input_idle, _peak_mb,
         _topmost_pid_at, _active_pid, _cursor_at, _cursor_point,
         _app_for, _activate, _point, _warp, _send, _mouse_ev, _wheel_ev, _key_ev,
-        DIGIT_KEYS, KEY_A, KEY_DELETE, KEY_RIGHT, read_text,
+        DIGIT_KEYS, KEY_A, KEY_DELETE, KEY_RIGHT, read_text, ocr_engine,
     )
+
+    # RapidOCR's model is Chinese and English, and it reads the game's icons as CJK
+    # glyphs: the menu as '口' and '三', the MARKET tab's shop icon as '司'. Glued
+    # onto a word ('MARKET司') one stops an exact match. The game writes English.
+    _CJK = re.compile("[⺀-〿぀-鿿가-힯豈-﫿＀-￯]+")
 
     def ocr(img) -> List[Line]:
         """RapidOCR in place of Vision (winplat.read_text), as the same Lines."""
-        out = [Line(t.translate(_LATIN), c, x, y, w, h) for t, c, x, y, w, h in read_text(img)]
+        out = []
+        for t, c, x, y, w, h in read_text(img):
+            t = " ".join(_CJK.sub(" ", t.translate(_LATIN)).split())
+            if t:
+                out.append(Line(t, c, x, y, w, h))
         out.sort(key=lambda l: (l.y, l.x))
         return out
 

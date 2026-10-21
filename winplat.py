@@ -98,6 +98,7 @@ def _scaled_crop(img, box, k: float):
 
 _ENGINE: list = []
 _ENGINE_LOCK = threading.Lock()
+_DEVICE = ["not started"]      # where _new_engine put the reader, for ocr_engine
 # RapidOCR stretches any image narrower or shorter than this up to it, text and all.
 DET_SIDE = 736
 
@@ -115,11 +116,27 @@ def _new_engine():
     try:
         import onnxruntime
         if "DmlExecutionProvider" in onnxruntime.get_available_providers():
-            return RapidOCR(params=dict(params, **{"EngineConfig.onnxruntime.use_dml": True,
-                                                   "Rec.rec_batch_num": 24}))
+            engine = RapidOCR(params=dict(params, **{"EngineConfig.onnxruntime.use_dml": True,
+                                                     "Rec.rec_batch_num": 24}))
+            _DEVICE[0] = "graphics card (DirectML)"
+            return engine
     except Exception:       # no DirectX 12 card, or a driver that refuses: the CPU reads
         pass
+    _DEVICE[0] = "CPU"
     return RapidOCR(params=params)
+
+
+def ocr_engine() -> str:
+    """Which reader runs, for the log: the graphics card or the CPU, and its version."""
+    with _ENGINE_LOCK:
+        if not _ENGINE:
+            _ENGINE.append(_new_engine())
+    try:
+        from importlib.metadata import version
+        ver = version("rapidocr")
+    except Exception:
+        ver = "?"
+    return "RapidOCR %s on the %s" % (ver, _DEVICE[0])
 
 
 def read_text(img) -> List[Tuple[str, float, float, float, float, float]]:
