@@ -1079,7 +1079,11 @@ def sort_direction(img, sort: Optional[Line], search: Optional[Line]):
     d = search.x - sort.x
     x0, x1 = sort.x + 0.45 * d, sort.x + 0.75 * d
     y0, y1 = sort.cy - 2.5 * sort.h, sort.cy + 2.5 * sort.h
-    cell = max(1.0, sort.h / 9.0)          # about 4 capture px at 2x, whatever the scale
+    # About 4 capture px at the Mac's 2x. Windows captures at 1x, where that rule
+    # gave 3 px cells over a 2 px shaft: the shaft blurred under the threshold and a
+    # bar was taken for it, so the arrow read None at most window sizes (measured
+    # 2026-10-21: 17 of 26 right). Every pixel there.
+    cell = 1.0 if WINDOWS else max(1.0, sort.h / 9.0)
     g = _luma_grid(img, x0, y0, x1, y1, (x1 - x0) / cell, (y1 - y0) / cell)
     lit = [[v > 90 for v in row] for row in g]
     if not lit:
