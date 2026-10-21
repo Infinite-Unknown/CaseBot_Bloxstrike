@@ -50,6 +50,14 @@ uv pip install -r requirements.txt
 `cd` into the folder you unzipped if you used the ZIP (its name ends in `-main`). The install is
 about 150 MB, most of it the text reader.
 
+**Updating an older install?** The text reader changed: older versions read the market wrong,
+and it now runs on your graphics card. Swap it over once, in the bot's folder:
+
+```powershell
+uv pip uninstall onnxruntime
+uv pip install -r requirements.txt
+```
+
 ### Start it
 
 1. Open Bloxstrike in Roblox and go to the **MARKET** tab.
@@ -65,8 +73,9 @@ about 150 MB, most of it the text reader.
 Windows needs no permissions. Two things to know:
 
 - If Roblox runs **as administrator**, Windows blocks the bot's clicks. Run both normally.
-- Reading the screen takes about 1 second a frame on Windows (a fraction of that on a Mac),
-  so the bot is a little slower to spot a cheap crate.
+- Reading the screen takes under a second a frame with a graphics card (DirectX 12, which
+  nearly every PC has), and about 3 to 4 seconds on the CPU alone, so without one the bot
+  is slower to spot a cheap crate.
 
 ## Mac
 
@@ -121,7 +130,7 @@ be slow for a few minutes. That passes on its own.
 4. Press **Start**. It asks whether to scan your inventory first. Yes counts your crates on
    the SELL tab before it starts buying.
 
-For the first run, leave **Dry run** on (Advanced tab). It opens listings and closes them
+For the first run, leave **Dry run** on (Config tab). It opens listings and closes them
 again without pressing PURCHASE, and the log says what it would have bought.
 
 ## The window
@@ -149,10 +158,17 @@ again without pressing PURCHASE, and the log says what it would have bought.
   - **Add a crate**: type the name as the game shows it after "Case |", for example
     `Apex Case`.
   - **Selling**: relist what it buys, sell after N buys, and the most crates per basket.
-- **Market filter**: the max price and rarity for the market filter. Roblox forgets the
-  filter when it reconnects, and the bot puts it back.
-- **Advanced**: sale tax, cases only, max purchases and max spend (or let your wallet
-  decide), how long you must be idle before a click, the time between refreshes, and Dry run.
+- **Config**: every other setting, and your configs.
+  - **Config**: pick which config is in use. Each one is a whole set of settings, crate
+    prices included, kept as its own file in `configs\`. **Save as new…** copies what the
+    window shows into a new config; **Delete** removes the one shown; **Undo unsaved
+    changes** goes back to its file; **Open file location** shows the bot's folder.
+    Switching with unsaved changes asks whether to save them first.
+  - **Safety**: Dry run, cases only, max purchases and max spend (or let your wallet decide).
+  - **Money**: the sale tax.
+  - **Timing**: how long you must be idle before a click, and the time between refreshes.
+  - **Market filter**: the max price and rarity for the market filter. Roblox forgets the
+    filter when it reconnects, and the bot puts it back.
 - **History**: this session's buys, listings and sales.
 
 ## What it does by itself
@@ -176,7 +192,7 @@ All in the bot's folder, and all left out of git:
 
 | File | What it holds |
 | --- | --- |
-| `settings.json` | your settings, written when you press Save settings |
+| `configs/` | one `.json` per config, written when you press Save, and `active.txt`, the one in use. An old `settings.json` moves in as `configs/default.json` the first time it starts |
 | `purchases.jsonl` | every buy, listing and sale |
 | `casebot.log` | everything it did |
 | `inventory.json` | the last inventory scan |
@@ -186,7 +202,8 @@ All in the bot's folder, and all left out of git:
 
 ```bash
 .venv/bin/python casebot.py --probe      # read the Roblox window and print what it sees, no clicks
-.venv/bin/python casebot.py --run        # run without the window, using settings.json
+.venv/bin/python casebot.py --run        # run without the window, using the active config
+.venv/bin/python casebot.py --run --config "night run"   # or a config of your choosing
 .venv/bin/python app.py --autostart      # open the window and press Start right away
 ```
 

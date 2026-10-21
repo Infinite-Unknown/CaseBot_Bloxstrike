@@ -14,6 +14,7 @@ import ctypes
 import math
 import os
 import threading
+import time
 from collections import namedtuple
 from typing import List, Optional, Tuple
 
@@ -101,13 +102,31 @@ _ENGINE_LOCK = threading.Lock()
 DET_SIDE = 736
 
 
+def _new_engine():
+    """RapidOCR on the graphics card through DirectML when there is one, else the CPU.
+
+    Measured 2026-10-21 on a 1920x1009 market frame (RTX 2060, 12-thread CPU): 3.6 s
+    a read on the CPU, 0.65 s on DirectML with batches of 24 lines, and the same text
+    either way. The bigger batch only pays on the card; on the CPU it is a little slower.
+    """
+    from rapidocr import RapidOCR
+    # no rotated text in this game, so no orientation pass
+    params = {"Global.log_level": "error", "Global.use_cls": False}
+    try:
+        import onnxruntime
+        if "DmlExecutionProvider" in onnxruntime.get_available_providers():
+            return RapidOCR(params=dict(params, **{"EngineConfig.onnxruntime.use_dml": True,
+                                                   "Rec.rec_batch_num": 24}))
+    except Exception:       # no DirectX 12 card, or a driver that refuses: the CPU reads
+        pass
+    return RapidOCR(params=params)
+
+
 def read_text(img) -> List[Tuple[str, float, float, float, float, float]]:
     """(text, confidence, x, y, w, h) for each line of text, in the image's pixels."""
     with _ENGINE_LOCK:
         if not _ENGINE:
-            from rapidocr import RapidOCR
-            # no rotated text in this game, so no orientation pass
-            _ENGINE.append(RapidOCR(params={"Global.log_level": "error", "Global.use_cls": False}))
+            _ENGINE.append(_new_engine())
     w, h = img.size
     if min(w, h) < DET_SIDE:
         # A close-up (the coin counter's strip, a basket price) goes on a canvas of
@@ -172,14 +191,30 @@ def _point(x: float, y: float):
     return Point(float(x), float(y))
 
 
+def _abs_move(x: float, y: float):
+    vx, vy, vw, vh = _virtual_screen()
+    dx = int(round((x - vx) * 65535.0 / max(1, vw - 1)))
+    dy = int(round((y - vy) * 65535.0 / max(1, vh - 1)))
+    flags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
+    return INPUT(INPUT_MOUSE, _INPUTUNION(mi=MOUSEINPUT(dx, dy, 0, flags, 0, 0)))
+
+
+def _rel_move(dx: int, dy: int):
+    return INPUT(INPUT_MOUSE, _INPUTUNION(mi=MOUSEINPUT(dx, dy, 0, MOUSEEVENTF_MOVE, 0, 0)))
+
+
 def _mouse_ev(kind: str, pt):
-    """A left-button 'move', 'down' or 'up' INPUT. down and up land where the pointer is."""
+    """A left-button 'move', 'down' or 'up' INPUT. down and up land where the pointer is.
+
+    A move is onto the point, then a one-pixel nudge there and back. Roblox follows
+    the mouse through raw input, which shows neither _warp (nothing at all) nor an
+    absolute move (flagged absolute, which it ignores), so it clicked wherever the
+    real mouse last moved. A relative nudge reads like a real mouse (proved
+    2026-10-21 with a raw-input listener). Pointer acceleration may leave the
+    pointer a pixel off the point, which is still on the button.
+    """
     if kind == "move":
-        vx, vy, vw, vh = _virtual_screen()
-        dx = int(round((pt.x - vx) * 65535.0 / max(1, vw - 1)))
-        dy = int(round((pt.y - vy) * 65535.0 / max(1, vh - 1)))
-        flags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
-        return INPUT(INPUT_MOUSE, _INPUTUNION(mi=MOUSEINPUT(dx, dy, 0, flags, 0, 0)))
+        return (_abs_move(pt.x, pt.y), _rel_move(1, 0), _rel_move(-1, 0))
     flags = {"down": MOUSEEVENTF_LEFTDOWN, "up": MOUSEEVENTF_LEFTUP}[kind]
     return INPUT(INPUT_MOUSE, _INPUTUNION(mi=MOUSEINPUT(0, 0, 0, flags, 0, 0)))
 
@@ -299,8 +334,15 @@ PW_CLIENTONLY, PW_RENDERFULLCONTENT = 0x1, 0x2
 SW_RESTORE = 9
 
 
+MOVE_FRAME = 0.017      # one frame at 60 fps, so Roblox sees each move on its own
+
+
 def _send(ev) -> None:
-    user32.SendInput(1, ctypes.byref(ev), ctypes.sizeof(INPUT))
+    """One INPUT, or a tuple of them a frame apart (_mouse_ev's move)."""
+    for i, one in enumerate(ev if isinstance(ev, tuple) else (ev,)):
+        if i:
+            time.sleep(MOVE_FRAME)
+        user32.SendInput(1, ctypes.byref(one), ctypes.sizeof(INPUT))
 
 
 def _virtual_screen() -> Tuple[int, int, int, int]:

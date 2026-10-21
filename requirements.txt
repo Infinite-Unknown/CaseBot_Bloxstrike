@@ -3,7 +3,11 @@ pyobjc-framework-Cocoa>=12; sys_platform == "darwin"
 pyobjc-framework-Quartz>=12; sys_platform == "darwin"
 pyobjc-framework-Vision>=12; sys_platform == "darwin"
 # Windows: RapidOCR reads the text (its models come inside the package)
-rapidocr>=3.4; sys_platform == "win32"
-onnxruntime>=1.20; sys_platform == "win32"
+# 3.9.2 or newer: before it, the default PP-OCRv4 models run words together
+# ('MintCondition', 'Case|GloveCase2') and no market card is found at all.
+rapidocr>=3.9.2; sys_platform == "win32"
+# the DirectML build runs it on any DirectX 12 graphics card, about 5x faster, and
+# on the CPU without one. It replaces plain onnxruntime: never install both.
+onnxruntime-directml>=1.20; sys_platform == "win32"
 pillow>=10; sys_platform == "win32"
 numpy>=1.24; sys_platform == "win32"

@@ -3,6 +3,7 @@ __pycache__/
 .DS_Store
 # written while it runs: yours, not the repo's
 settings.json
+configs/
 purchases.jsonl
 casebot.log
 inventory.json

@@ -38,7 +38,12 @@ if not WINDOWS:
 _pool = contextlib.nullcontext if WINDOWS else objc.autorelease_pool
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# Where settings lived before configs\: moved in as configs\default.json on first start.
 SETTINGS_PATH = os.path.join(HERE, "settings.json")
+# One settings file per config, by name, and which of them is in use.
+CONFIGS_DIR = os.path.join(HERE, "configs")
+ACTIVE_CONFIG_PATH = os.path.join(CONFIGS_DIR, "active.txt")
+DEFAULT_CONFIG = "default"
 PURCHASES_PATH = os.path.join(HERE, "purchases.jsonl")
 FAILURES_DIR = os.path.join(HERE, "failures")
 LOG_PATH = os.path.join(HERE, "casebot.log")
@@ -294,7 +299,7 @@ class Settings:
     # save a scratch copy overwrote infinite's own settings.json instead.
     @staticmethod
     def load(path: Optional[str] = None) -> "Settings":
-        path = path or SETTINGS_PATH
+        path = path or config_path(active_config())
         try:
             with open(path) as fh:
                 raw = json.load(fh)
@@ -311,11 +316,80 @@ class Settings:
         return s
 
     def save(self, path: Optional[str] = None) -> None:
-        path = path or SETTINGS_PATH
+        path = path or config_path(active_config())
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         data = {k: v for k, v in asdict(self).items() if k not in TIER_FIELDS}
         with open(path, "w") as fh:
             json.dump(data, fh, indent=2)
             fh.write("\n")
+
+
+# --------------------------------------------------------------------------- configs
+# Named settings files in configs\, one of them active. Looked up when called, like
+# Settings.load, so a patched CONFIGS_DIR is honoured.
+
+# What Windows refuses in a file name, plus the dot that would hide or stack extensions.
+_BAD_NAME_CHARS = set('<>:"/\\|?*.')
+_RESERVED_NAMES = {"con", "prn", "aux", "nul", "active"} | {"com%d" % i for i in range(10)} \
+    | {"lpt%d" % i for i in range(10)}
+
+
+def config_path(name: str) -> str:
+    return os.path.join(CONFIGS_DIR, name + ".json")
+
+
+def _migrate_settings() -> None:
+    """settings.json from before configs\\ becomes configs\\default.json, once."""
+    os.makedirs(CONFIGS_DIR, exist_ok=True)
+    if os.path.exists(SETTINGS_PATH) and not list_configs():
+        os.replace(SETTINGS_PATH, config_path(DEFAULT_CONFIG))
+
+
+def list_configs() -> List[str]:
+    """The configs saved in configs\\, by name, A to Z."""
+    try:
+        files = os.listdir(CONFIGS_DIR)
+    except OSError:
+        return []
+    return sorted((f[:-5] for f in files if f.lower().endswith(".json")), key=str.lower)
+
+
+def active_config() -> str:
+    """The config in use: the one active.txt names if it still exists, else the first, else default."""
+    _migrate_settings()
+    try:
+        with open(ACTIVE_CONFIG_PATH, encoding="utf-8") as fh:
+            name = fh.read().strip()
+    except OSError:
+        name = ""
+    have = list_configs()
+    if name in have:
+        return name
+    return DEFAULT_CONFIG if DEFAULT_CONFIG in have or not have else have[0]
+
+
+def set_active_config(name: str) -> None:
+    os.makedirs(CONFIGS_DIR, exist_ok=True)
+    with open(ACTIVE_CONFIG_PATH, "w", encoding="utf-8") as fh:
+        fh.write(name + "\n")
+
+
+def config_name(text) -> Tuple[str, Optional[str]]:
+    """A typed config name: (name, None), or (name, why it cannot be a file name)."""
+    name = " ".join(str(text or "").split())
+    if not name:
+        return name, "type a name for the config first"
+    if len(name) > 40:
+        return name, "a config name is at most 40 characters"
+    if any(c in _BAD_NAME_CHARS for c in name):
+        return name, "a config name cannot hold any of  < > : \" / \\ | ? * ."
+    if name.lower() in _RESERVED_NAMES:
+        return name, "%r is a name Windows keeps for itself" % name
+    return name, None
+
+
+def delete_config(name: str) -> None:
+    os.remove(config_path(name))
 
 
 def crates_from_tiers(s: Settings) -> Dict[str, Dict[str, Optional[int]]]:
@@ -821,7 +895,8 @@ def bounds_differ(a: Optional[dict], b: Optional[dict], tol: float = 2.0) -> boo
 # --------------------------------------------------------------------------- parsing
 
 
-CASE_RE = re.compile(r"^Case\s*\|?\s+(.+)$")
+# RapidOCR's older models drop the space after the bar ('Case|Anime Case')
+CASE_RE = re.compile(r"^Case\s*(?:\|\s*|\s+)(.+)$")
 GENERIC_RE = re.compile(r"^(.+?)\s+\|\s+(.+)$")
 INT_RE = re.compile(r"^\d{1,3}$")
 PRICE_RE = re.compile(r"^\d{1,6}$")     # a listing price can pass 999
@@ -830,7 +905,7 @@ SERIAL_RE = re.compile(r"#[\d,]{3,}")
 RAP_RE = re.compile(r"RAP:?\s*([\d,]+)")
 # The wear grades a card prints directly beneath its title.
 CONDITION_RE = re.compile(
-    r"^(Mint Condition|Near-?Mint|Standard-?Grade|Combat-?Worn|War-?Torn|Factory New|Field-?Tested|Battle-?Scarred|Well-?Worn)",
+    r"^(Mint ?Condition|Near-?Mint|Standard-?Grade|Combat-?Worn|War-?Torn|Factory ?New|Field-?Tested|Battle-?Scarred|Well-?Worn)",
     re.I,
 )
 
@@ -5312,14 +5387,18 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="casebot")
     ap.add_argument("--probe", action="store_true", help="read the live window, no input events")
     ap.add_argument("--parse", metavar="PNG", help="read a fixture instead of the screen")
-    ap.add_argument("--run", action="store_true", help="headless loop with settings.json")
+    ap.add_argument("--run", action="store_true", help="headless loop with the active config")
+    ap.add_argument("--config", metavar="NAME", help="use this config from configs\\ instead")
     ap.add_argument(
         "--typetest",
         action="store_true",
         help="type into the market search box to see which keystroke style Roblox takes",
     )
     args = ap.parse_args(argv)
-    s = Settings.load()
+    if args.config and args.config not in list_configs():
+        print("no config %r in %s: have %s" % (args.config, CONFIGS_DIR, ", ".join(list_configs())))
+        return 1
+    s = Settings.load(config_path(args.config) if args.config else None)
 
     if args.parse:
         img = load_png(args.parse)

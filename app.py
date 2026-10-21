@@ -6,12 +6,13 @@ thread (the bot, or an inventory scan while it is stopped) and reaches the GUI o
 as a message on a queue.
 """
 
+import os
 import queue
 import sys
 import threading
 import traceback
 import tkinter as tk
-from dataclasses import replace
+from dataclasses import asdict, replace
 from tkinter import font as tkfont
 from tkinter import messagebox, ttk
 from typing import Dict, Optional, Tuple
@@ -192,7 +193,11 @@ class App:
     def __init__(self, root: tk.Tk, settings: Optional[cb.Settings] = None):
         self.root = root
         self.q = queue.Queue()
+        # The config the window shows and Save writes: one file in configs\.
+        self.config_name = cb.active_config()
         self.settings = settings or cb.Settings.load()
+        # Each Ignore box's grey-out, rerun when a config is loaded into the window.
+        self._greys = []
         self.bot = None
         # The run that last finished, so its numbers stay on the dashboard.
         self.last_bot = None
@@ -209,8 +214,9 @@ class App:
         # IO, so the main thread may; a scan itself always runs in a worker.
         self.snapshot = cb.read_inventory()
         self._bad_snap = None
-        root.title("casebot")
         self._build()
+        self._title()
+        self._mark_saved()
         self._refresh_dashboard()
         # The table shows this session only. purchases.jsonl keeps every record, so
         # the permanent ledger survives; it is just not replayed into the window.
@@ -264,8 +270,7 @@ class App:
         for title, build in (
             ("Dashboard", self._build_dashboard),
             ("Crates", self._build_crates),
-            ("Market filter", self._build_filter),
-            ("Advanced", self._build_advanced),
+            ("Config", self._build_config),
             ("History", self._build_history),
         ):
             tab = ttk.Frame(self.book, padding=PAD)
@@ -275,11 +280,11 @@ class App:
         bottom = ttk.Frame(self.root, padding=(PAD, 0, PAD, PAD))
         bottom.grid(row=2, column=0, sticky="ew")
         ttk.Button(bottom, text="Save settings", command=self.save).grid(row=0, column=0)
-        ttk.Label(
-            bottom,
-            text="Saved to settings.json. A running bot keeps the settings it started with.",
-            style="Hint.TLabel",
-        ).grid(row=0, column=1, sticky="w", padx=PAD)
+        ttk.Button(bottom, text="Open file location", command=self.open_folder
+                   ).grid(row=0, column=1, padx=(8, 0))
+        self.save_note = tk.StringVar(master=self.root)
+        ttk.Label(bottom, textvariable=self.save_note, style="Hint.TLabel"
+                  ).grid(row=0, column=2, sticky="w", padx=PAD)
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
 
@@ -361,7 +366,7 @@ class App:
                  "Glove Case 2.\nDrag a row by its \u2261 to set its priority: higher is bought and "
                  "listed first.\nUntick On to pause a crate: it keeps its prices. Blank Buy up to: never "
                  "bought. Blank Sell at: never listed.\nEarn per flip is what one crate makes after the "
-                 "sale tax (Advanced).",
+                 "sale tax (Config).",
             style="Hint.TLabel", justify="left",
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
@@ -398,30 +403,65 @@ class App:
         inner.update_idletasks()
         fit()
 
-    def _build_filter(self, tab):
-        self._spin(tab, "filter_price_max", "Max price", 1, 99_999_999, "typed into the filter's To box")
+    def _build_config(self, tab):
+        """Every setting outside the crate table, in sections, with Save and the bot's folder."""
+        def section(title, row, col):
+            box = ttk.LabelFrame(tab, text=title, padding=8)
+            box.grid(row=row, column=col, sticky="nsew", padx=4, pady=4)
+            return box
+
+        # Which config: every setting on every tab, the crate table included, is one
+        # file in configs\, and this picks which one the window shows and Save writes.
+        configs = section("Config", 0, 0)
+        configs.grid(columnspan=2, sticky="ew")
+        ttk.Label(configs, text="Config").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.config_var = tk.StringVar(master=self.root, value=self.config_name)
+        self.config_box = ttk.Combobox(configs, textvariable=self.config_var, state="readonly", width=24,
+                                       values=cb.list_configs() or [self.config_name])
+        self.config_box.grid(row=0, column=1, sticky="w")
+        self.config_box.bind("<<ComboboxSelected>>", lambda e: self._switch_config(self.config_var.get()))
+        for c, (text, command) in enumerate((
+            ("Save", self.save),
+            ("Save as new…", self._save_config_as),
+            ("Undo unsaved changes", self._reload_settings),
+            ("Delete", self._delete_config),
+            ("Open file location", self.open_folder),
+        ), start=2):
+            ttk.Button(configs, text=text, command=command).grid(row=0, column=c, sticky="w", padx=(8, 0))
+        ttk.Label(configs, text="Each config is its own file in %s, crate prices included. "
+                                "Pick one to switch; Start uses the one shown." % cb.CONFIGS_DIR,
+                  style="Hint.TLabel").grid(row=1, column=0, columnspan=7, sticky="w", pady=(6, 0))
+
+        safety = section("Safety", 1, 0)
+        self._check(safety, "dry_run", "Dry run (never presses PURCHASE)")
+        self._check(safety, "cases_only", "Cases only: never buy a knife, a gun or gloves")
+        self._cap(safety, "max_purchases", "dynamic_purchases", "Max purchases")
+        self._cap(safety, "max_spend", "dynamic_spend", "Max spend")
+
+        money = section("Money", 1, 1)
+        self._entry(money, "sell_tax", "Sale tax", "0.05 is the game's 5%, and the least it takes:\n"
+                                                   "Earn per flip and the dashboard use it")
+        self.vars["sell_tax"].trace_add("write", lambda *_: self._tax_typed())
+
+        timing = section("Timing", 2, 0)
+        # 0.05 steps: a Scale snaps its variable to its resolution as it is built, so
+        # at 0.5 a saved 2.3 s cooldown opened as 2.5 and Save wrote that back.
+        self._slider(timing, "idle_seconds", "Idle seconds before a click", 0.5, 5, 0.05,
+                     "how long your mouse and keys\nmust rest first")
+        self._slider(timing, "refresh_cooldown", "Min seconds between refreshes", 0.5, 10, 0.05,
+                     "a floor: the real countdown\nis about 7 s")
+
+        market = section("Market filter", 2, 1)
+        self._spin(market, "filter_price_max", "Max price", 1, 99_999_999, "typed into the filter's To box")
         var = tk.StringVar(master=self.root, value=self.settings.filter_rarity or ANY)
         self.vars["filter_rarity"] = var
         self.widgets["filter_rarity"] = self._row(
-            tab, "Rarity", no_nudge(ttk.Combobox(tab, textvariable=var, values=("Red", ANY), width=12)),
-            "(any) leaves the rarity alone and checks the price only",
+            market, "Rarity", no_nudge(ttk.Combobox(market, textvariable=var, values=("Red", ANY), width=12)),
+            "(any) leaves the rarity alone\nand checks the price only",
         )
-        self._check(tab, "restore_filter", "Put the market filter back when Roblox resets it")
-
-    def _build_advanced(self, tab):
-        self._entry(tab, "sell_tax", "Sale tax", "0.05 is the game's 5%, and the least it takes: "
-                                                 "Earn per flip and the dashboard use it")
-        self.vars["sell_tax"].trace_add("write", lambda *_: self._tax_typed())
-        self._check(tab, "cases_only", "Cases only: never buy a knife, a gun or gloves")
-        self._cap(tab, "max_purchases", "dynamic_purchases", "Max purchases")
-        self._cap(tab, "max_spend", "dynamic_spend", "Max spend")
-        # 0.05 steps: a Scale snaps its variable to its resolution as it is built, so
-        # at 0.5 a saved 2.3 s cooldown opened as 2.5 and Save wrote that back.
-        self._slider(tab, "idle_seconds", "Idle seconds before a click", 0.5, 5, 0.05,
-                     "how long your mouse and keys must rest first")
-        self._slider(tab, "refresh_cooldown", "Min seconds between refreshes", 0.5, 10, 0.05,
-                     "a floor: the real countdown is about 7 s")
-        self._check(tab, "dry_run", "Dry run (never presses PURCHASE)")
+        self._check(market, "restore_filter", "Put the market filter back when Roblox resets it")
+        for c in range(2):
+            tab.columnconfigure(c, weight=1, uniform="config")
 
     def _build_history(self, tab):
         # The log itself lives on the Dashboard: one Text growing all night, not two.
@@ -540,7 +580,7 @@ class App:
         """The Sale tax box as typed, or the saved tax while the box holds no usable one."""
         var = self.vars.get("sell_tax")
         if var is None:
-            return self.settings.sell_tax       # the Advanced tab is built after this one
+            return self.settings.sell_tax       # the Config tab is built after this one
         try:
             tax = float(var.get().strip())
         except ValueError:
@@ -656,6 +696,7 @@ class App:
         def grey():
             box.state(["disabled"] if var.get() else ["!disabled"])
 
+        self._greys.append(grey)
         tick = self.widgets[flag] = ttk.Checkbutton(
             tab, text="Ignore: buy while the balance allows", variable=var, command=grey
         )
@@ -701,7 +742,8 @@ class App:
         # still keep a sale tax such as 0.025, which 2 places turned into 0.03.
         return round(float(raw), 4) if kind is float else int(raw)
 
-    def collect(self) -> cb.Settings:
+    def collect(self, quiet: bool = False) -> cb.Settings:
+        """The window's settings. quiet: only to compare, so nothing is logged or counted."""
         # From the last settings rather than Settings(): a field with no control here
         # (the old tier fields) keeps its value instead of quietly going back to the default.
         s = replace(self.settings)
@@ -730,6 +772,8 @@ class App:
                 % (s.idle_seconds, cb.MIN_IDLE_SECONDS)
             )
             s.idle_seconds = cb.MIN_IDLE_SECONDS
+        if quiet:
+            return s
         for complaint in said:
             self._write_log(complaint)
         # Counted for the status line (_rejected_note): a complaint that only reached
@@ -746,9 +790,141 @@ class App:
 
     def save(self):
         self.settings = self.collect()
-        self.settings.save(cb.SETTINGS_PATH)
-        self._write_log("saved %s" % cb.SETTINGS_PATH)
-        self._say("settings saved" + self._rejected_note())
+        path = cb.config_path(self.config_name)
+        self.settings.save(path)
+        self._mark_saved()
+        cb.set_active_config(self.config_name)
+        self._refresh_configs()
+        self._write_log("saved %s" % path)
+        self._say("saved config %s" % self.config_name + self._rejected_note())
+
+    # -- configs: named settings files in configs\
+
+    def _title(self):
+        self.root.title("casebot — %s" % self.config_name)
+        self.save_note.set("Saves to %s. A running bot keeps the settings it started with."
+                           % os.path.join("configs", self.config_name + ".json"))
+
+    def _refresh_configs(self):
+        self.config_box.configure(values=cb.list_configs() or [self.config_name])
+        self.config_var.set(self.config_name)
+        self._title()
+
+    def _unsaved(self) -> bool:
+        """True when the window holds edits its config's file does not."""
+        return asdict(self.collect(quiet=True)) != self._saved_view
+
+    def _ask_save_first(self, doing: str) -> bool:
+        """Offer to save unsaved edits before they are dropped. False: the person cancelled."""
+        if not self._unsaved():
+            return True
+        answer = messagebox.askyesnocancel(
+            "Unsaved changes",
+            "Config %s has unsaved changes.\n\nSave them before %s?" % (self.config_name, doing),
+            parent=self.root)
+        if answer is None:
+            return False
+        if answer:
+            self.save()
+        return True
+
+    def _apply_settings(self, s: cb.Settings) -> None:
+        """Show a config's settings in every control, the crate table rebuilt from it."""
+        self.settings = s
+        for key, var in self.vars.items():
+            value = getattr(s, key)
+            if key == "filter_rarity":
+                value = value or ANY
+            var.set(value if isinstance(var, (tk.BooleanVar, tk.IntVar, tk.DoubleVar)) else str(value))
+        for grey in self._greys:
+            grey()
+        for name in list(self.crate_rows):
+            row = self.crate_rows.pop(name)
+            for w in row["widgets"] + (row["handle"],):
+                w.destroy()
+        for name, row in s.crates.items():
+            self._crate_row(name, *("" if row.get(k) is None else str(row[k]) for k in ("buy", "sell")),
+                            on=row.get("on", True) is not False)
+        self._show_all_earn()
+        self._mark_saved()
+
+    def _mark_saved(self) -> None:
+        # What the window reads as now, the yardstick for _unsaved: comparing with the
+        # file itself flagged a fresh load, whose crate rows read back with an "on" added.
+        self._saved_view = asdict(self.collect(quiet=True))
+
+    def _switch_config(self, name: str) -> None:
+        if name == self.config_name:
+            return
+        if not self._ask_save_first("switching to %s" % name):
+            self.config_var.set(self.config_name)
+            return
+        self.config_name = name
+        cb.set_active_config(name)
+        self._apply_settings(cb.Settings.load(cb.config_path(name)))
+        self._refresh_configs()
+        self._write_log("switched to config %s" % name)
+        self._say("using config %s" % name)
+
+    def _save_config_as(self) -> None:
+        """The window's settings as a new config, which then becomes the one in use."""
+        from tkinter import simpledialog
+        typed = simpledialog.askstring("Save as new config", "Name for the new config:",
+                                       initialvalue="%s copy" % self.config_name, parent=self.root)
+        if typed is None:
+            return
+        name, refused = cb.config_name(typed)
+        if refused:
+            messagebox.showerror("Save as new config", refused, parent=self.root)
+            return
+        if any(n.lower() == name.lower() for n in cb.list_configs()) and not messagebox.askyesno(
+                "Save as new config", "A config called %s exists. Replace it?" % name, parent=self.root):
+            return
+        self.config_name = name
+        self.save()
+        self._say("saved as new config %s, now in use" % name)
+
+    def _reload_settings(self) -> None:
+        """Back to what the config's file says, dropping every edit since the last Save."""
+        self._apply_settings(cb.Settings.load(cb.config_path(self.config_name)))
+        self._say("config %s reloaded from its file" % self.config_name)
+
+    def _delete_config(self) -> None:
+        others = [n for n in cb.list_configs() if n != self.config_name]
+        if not others:
+            messagebox.showinfo("Delete config", "This is the only config: make another with "
+                                "Save as new first.", parent=self.root)
+            return
+        if not messagebox.askyesno("Delete config", "Delete config %s? Its file is removed for good."
+                                   % self.config_name, parent=self.root):
+            return
+        gone = self.config_name
+        try:
+            cb.delete_config(gone)
+        except OSError as exc:
+            self._say("could not delete %s: %s" % (gone, exc))
+            return
+        self.config_name = others[0]
+        cb.set_active_config(self.config_name)
+        self._apply_settings(cb.Settings.load(cb.config_path(self.config_name)))
+        self._refresh_configs()
+        self._write_log("deleted config %s, now using %s" % (gone, self.config_name))
+        self._say("deleted %s, now using %s" % (gone, self.config_name))
+
+    def open_folder(self) -> None:
+        """Show the bot's folder in Explorer (Finder on a Mac), the active config picked out."""
+        import subprocess
+        target = cb.config_path(self.config_name)
+        try:
+            if cb.WINDOWS:
+                if os.path.exists(target):
+                    subprocess.Popen(["explorer", "/select,", target])
+                else:
+                    os.startfile(cb.HERE)
+            else:
+                subprocess.Popen(["open", "-R", target] if os.path.exists(target) else ["open", cb.HERE])
+        except OSError as exc:
+            self._say("could not open %s: %s" % (cb.HERE, exc))
 
     # -- run
 
@@ -1040,7 +1216,32 @@ class App:
             anchor="w",
             padx=8,
         ).pack(fill="both", expand=True)
+        if cb.WINDOWS:
+            self._click_through(top)
         self.overlay = top
+
+    @staticmethod
+    def _click_through(top):
+        """Let clicks pass the overlay to the game under it (Windows).
+
+        It sits over Roblox's own bottom-left buttons, which it used to swallow.
+        Layered and transparent, Windows hands every click to the window beneath,
+        and winplat._windows skips it, so the bot never takes it for a cover either.
+        """
+        import ctypes
+        # first: Tk rewrites the extended style when it sets alpha
+        top.wm_attributes("-alpha", 0.85)
+        top.update_idletasks()
+        user32 = ctypes.windll.user32
+        user32.GetParent.restype = ctypes.c_void_p
+        user32.GetParent.argtypes = [ctypes.c_void_p]
+        user32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user32.SetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
+        hwnd = user32.GetParent(top.winfo_id()) or top.winfo_id()
+        GWL_EXSTYLE = -20
+        # layered, transparent, never activated, and no taskbar button
+        ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE) | 0x80000 | 0x20 | 0x8000000 | 0x80
+        user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex)
 
     def _update_overlay(self):
         if self.overlay is None or self.bot is None:
