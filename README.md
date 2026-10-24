@@ -217,6 +217,10 @@ On Windows, write `.venv\Scripts\python` in place of `.venv/bin/python`.
 - **Start says it cannot record the screen** (Mac): see "Allow it to see and click" above.
 - **Clicks do nothing**: on a Mac, turn on Accessibility for your terminal. On Windows,
   check Roblox is not running as administrator.
+- **Slow to buy** (Windows): look in the log for `text reader:` and `reading the screen on`.
+  If they say CPU, the graphics card part is not installed: run the update step under
+  Install, then start the bot again. The log also gives the time a read takes every 10
+  minutes (`reads ... s each`): under a second on a graphics card, 3 to 4 on the CPU.
 - **`uv` is not recognised** (Windows): close PowerShell and open a new one after installing uv.
 - **Anything else**: read the log on the Dashboard, and look in `failures/` for a screenshot
   of what the bot saw.

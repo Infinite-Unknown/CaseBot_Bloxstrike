@@ -98,32 +98,71 @@ def _scaled_crop(img, box, k: float):
 
 _ENGINE: list = []
 _ENGINE_LOCK = threading.Lock()
-_DEVICE = ["not started"]      # where _new_engine put the reader, for ocr_engine
+_DEVICE = ["not started"]      # where the reader runs, for ocr_engine and the log
+_CHECKED: list = []         # the first read has said whether the card really took the models
 # RapidOCR stretches any image narrower or shorter than this up to it, text and all.
 DET_SIDE = 736
 
 
-def _new_engine():
+def _new_engine(gpu: bool = True):
     """RapidOCR on the graphics card through DirectML when there is one, else the CPU.
 
     Measured 2026-10-21 on a 1920x1009 market frame (RTX 2060, 12-thread CPU): 3.6 s
     a read on the CPU, 0.65 s on DirectML with batches of 24 lines, and the same text
     either way. The bigger batch only pays on the card; on the CPU it is a little slower.
+    On a laptop DirectML picks the faster of its two chips by itself (onnxruntime sorts
+    them high performance first): a friend's RTX 3050 laptop reading at CPU pace was
+    DirectML never loading, not the wrong chip.
     """
     from rapidocr import RapidOCR
     # no rotated text in this game, so no orientation pass
     params = {"Global.log_level": "error", "Global.use_cls": False}
+    if not gpu:
+        return RapidOCR(params=params)
     try:
         import onnxruntime
-        if "DmlExecutionProvider" in onnxruntime.get_available_providers():
-            engine = RapidOCR(params=dict(params, **{"EngineConfig.onnxruntime.use_dml": True,
-                                                     "Rec.rec_batch_num": 24}))
-            _DEVICE[0] = "graphics card (DirectML)"
-            return engine
-    except Exception:       # no DirectX 12 card, or a driver that refuses: the CPU reads
-        pass
-    _DEVICE[0] = "CPU"
-    return RapidOCR(params=params)
+        have = onnxruntime.get_available_providers()
+    except Exception:
+        have = []
+    if "DmlExecutionProvider" not in have:
+        _DEVICE[0] = ("CPU, slowly: the graphics card build of onnxruntime is not installed "
+                      "(run the README's update step)")
+        return RapidOCR(params=params)
+    try:
+        engine = RapidOCR(params=dict(params, **{"EngineConfig.onnxruntime.use_dml": True,
+                                                 "Rec.rec_batch_num": 24}))
+    except Exception as exc:    # a driver that refuses: the CPU reads
+        _DEVICE[0] = "CPU, slowly: the graphics card refused (%s)" % exc
+        return RapidOCR(params=params)
+    _DEVICE[0] = "graphics card (DirectML)"
+    return engine
+
+
+def _provider(engine) -> str:
+    """Where the engine's text finder really runs, once its models have loaded."""
+    try:
+        return engine.text_det.session.session.get_providers()[0]
+    except Exception:
+        return ""
+
+
+def _first_read(img):
+    """The first read, which loads the models: only now is it known whether the card took them."""
+    on_card = _DEVICE[0].startswith("graphics card")
+    try:
+        out = _ENGINE[0](img)
+    except Exception as exc:
+        if not on_card:
+            raise
+        # DirectML can fail as the models load (a chip asleep or out of memory), and
+        # onnxruntime only falls back by itself on some errors: the rest failed every read.
+        _ENGINE[0] = _new_engine(gpu=False)
+        _DEVICE[0] = "CPU, slowly: DirectML failed as it loaded (%s)" % exc
+        return _ENGINE[0](img)
+    if on_card and _provider(_ENGINE[0]) == "CPUExecutionProvider":
+        # onnxruntime fell back by itself: the reads work, at the CPU's pace
+        _DEVICE[0] = "CPU, slowly: DirectML would not start on this graphics card"
+    return out
 
 
 def ocr_engine() -> str:
@@ -153,7 +192,13 @@ def read_text(img) -> List[Tuple[str, float, float, float, float, float]]:
         canvas = Image.new("RGB", (max(w, DET_SIDE), max(h, DET_SIDE)), bg)
         canvas.paste(img, (0, 0))
         img = canvas
-    out = _ENGINE[0](img)
+    out = None
+    with _ENGINE_LOCK:      # one thread loads the models; another waits rather than loading twice
+        if not _CHECKED:
+            _CHECKED.append(True)
+            out = _first_read(img)
+    if out is None:
+        out = _ENGINE[0](img)
     if out.boxes is None or out.txts is None:
         return []
     lines = []

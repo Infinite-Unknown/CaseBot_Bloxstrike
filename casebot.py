@@ -1052,12 +1052,19 @@ def parse_sell_filters(lines: List[Line]) -> dict:
     out = {"category": None, "sort": None, "search": search}
     if search is None:
         return out
-    # Each dropdown's chevron may come with its label, as a symbol or a lone letter
-    # ('Newest ^', 'Quality v'): only the words count.
+    def words(l):
+        # Each dropdown's chevron may come with its label, as a symbol or a lone letter
+        # ('Newest ^', 'Quality v'): only the words count.
+        m = re.match(r"^([A-Za-z][A-Za-z ]{2,}?)[\s\W\d_]*$", l.text.strip())
+        if m is None:
+            return None
+        text = re.sub(r"(\s+[A-Za-z])+$", "", m.group(1).strip())
+        # the line itself when nothing came off, so it is still the same line to a caller
+        return l if text == l.text else replace(l, text=text)
+
     row = sorted(
-        (replace(l, text=re.sub(r"(\s+[A-Za-z])+$", "", m.group(1).strip())) for l in lines
-         if abs(l.cy - search.cy) < search.h and l.x < search.x
-         for m in [re.match(r"^([A-Za-z][A-Za-z ]{2,}?)[\s\W\d_]*$", l.text.strip())] if m),
+        (w for w in (words(l) for l in lines if abs(l.cy - search.cy) < search.h and l.x < search.x)
+         if w is not None),
         key=lambda l: l.x,
     )
     sorts = [l for l in row if l.text.strip().lower() in SORT_OPTIONS]
@@ -2704,6 +2711,9 @@ class Bot:
         self._capture_refused = False      # the window capture was refused outright
         self._blocked_alerted = False      # the Mac has been told about this outage
         self.ocr = ocr
+        self._ocr_said = None       # the chip reading the screen, as last logged (Windows)
+        self._read_secs = 0.0       # time in full reads since the last heartbeat, and how many
+        self._reads = 0
         self.click_at = click_at
         self.scroll_at = scroll_at
         self.button_ready = button_ready
@@ -2742,9 +2752,13 @@ class Bot:
             return
         self._last_heartbeat = time.time()
         peak = _peak_mb()
+        # The read time says whether a slow bot is a slow reader: about 0.2 s on a Mac,
+        # 0.7 s on a Windows graphics card, 3 to 4 s on a Windows CPU.
+        reads = ", reads %.1f s each" % (self._read_secs / self._reads) if self._reads else ""
+        self._read_secs, self._reads = 0.0, 0
         self.log(
-            "peak memory %.0f MB after %d buys: clicks %d, history %d, parked %d"
-            % (peak, self.bought, len(self.clicks), len(self.history), len(self._blocked))
+            "peak memory %.0f MB after %d buys: clicks %d, history %d, parked %d%s"
+            % (peak, self.bought, len(self.clicks), len(self.history), len(self._blocked), reads)
         )
 
     def _flush_repeats(self) -> None:
@@ -2785,6 +2799,10 @@ class Bot:
         loop that drives cycle() directly (app.py does) gets it too.
         """
         self._begun = True
+        if WINDOWS:
+            # here, not in run(): the window drives cycle() and never calls run()
+            self.log("text reader: %s" % ocr_engine())
+            self._ocr_said = _DEVICE[0]
         self.load_inventory()
         if self.scan_on_start:
             self.request_scan()
@@ -2879,8 +2897,12 @@ class Bot:
         no runloop, so nothing drains the pool these frameworks autorelease into, and
         an overnight run grew by gigabytes until the process died.
         """
+        t = time.time()
         with _pool():
-            return self._read_frame()
+            frame = self._read_frame()
+        self._read_secs += time.time() - t
+        self._reads += 1
+        return frame
 
     def _read_frame(self):
         # the window list query costs ~2 ms: re-read the bounds every frame, otherwise
@@ -2908,6 +2930,12 @@ class Bot:
                                else "Roblox window gone (capture returned nothing)")
         self._blocked_alerted = False
         lines = self.ocr(img)
+        # Only a read loads the models, so only now is it known whether the card really
+        # took them: the text reader line at the start can say graphics card and still
+        # be the CPU, which is said here as soon as it is known.
+        if WINDOWS and _DEVICE[0] != self._ocr_said:
+            self._ocr_said = _DEVICE[0]
+            self.log("reading the screen on the %s" % self._ocr_said)
         lines = self._voted_counter(img, lines)
         if self.bounds and self.bounds["Width"]:
             self.scale = img_size(img)[0] / float(self.bounds["Width"])
@@ -5344,8 +5372,6 @@ class Bot:
         self.attach()
         self.begin()
         self.log("running (dry_run=%s)" % self.s.dry_run)
-        if WINDOWS:
-            self.log("text reader: %s" % ocr_engine())
         while not self.stop_event.is_set() and not self.done():
             try:
                 self.cycle()
@@ -5540,7 +5566,7 @@ if WINDOWS:
         _sample, _luma_grid, _rgb_grid, _scaled_crop, _session_idle, _input_idle, _peak_mb,
         _topmost_pid_at, _active_pid, _cursor_at, _cursor_point,
         _app_for, _activate, _point, _warp, _send, _mouse_ev, _wheel_ev, _key_ev,
-        DIGIT_KEYS, KEY_A, KEY_DELETE, KEY_RIGHT, read_text, ocr_engine,
+        DIGIT_KEYS, KEY_A, KEY_DELETE, KEY_RIGHT, read_text, ocr_engine, _DEVICE,
     )
 
     # RapidOCR's model is Chinese and English, and it reads the game's icons as CJK
