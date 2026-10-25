@@ -875,6 +875,25 @@ def mean_rgb(img, x0: float, y0: float, x1: float, y1: float):
 
 DIM_THRESHOLD = 22.0
 
+# A full read slower than this (RapidOCR on Windows: about 1.8 s on a laptop's graphics
+# card, 3 to 4 s on a CPU) looks at the screen cheaply after a click before reading it.
+SLOW_READ = 0.6
+SETTLE_POLL = 0.05      # seconds between those cheap looks
+SETTLE_MAX = 0.8        # and the most spent on them before reading anyway
+
+
+def frame_key(img) -> List[float]:
+    """A capture as 32 x 18 cells of brightness: cheap, and enough to see a window open."""
+    W, H = img_size(img)
+    return [v for row in _luma_grid(img, 0, 0, W, H, 32, 18) for v in row]
+
+
+def cells_changed(a: Optional[List[float]], b: Optional[List[float]]) -> float:
+    """The share of cells whose brightness moved by more than 12 between two frame_keys."""
+    if not a or not b or len(a) != len(b):
+        return 1.0
+    return sum(abs(x - y) > 12 for x, y in zip(a, b)) / float(len(a))
+
 
 # Measured live 2026-09-19 over a full refresh cycle: the pill reads green 98.7 when
 # it is ready and 33.9 to 42 while counting down, every frame, so the gap is wide
@@ -2714,6 +2733,8 @@ class Bot:
         self._ocr_said = None       # the chip reading the screen, as last logged (Windows)
         self._read_secs = 0.0       # time in full reads since the last heartbeat, and how many
         self._reads = 0
+        self._read_avg = 0.0        # a running average of one full read, for _await_screen
+        self._last_key = None       # frame_key of the last frame read, kept only when reads are slow
         self.click_at = click_at
         self.scroll_at = scroll_at
         self.button_ready = button_ready
@@ -2900,7 +2921,13 @@ class Bot:
         t = time.time()
         with _pool():
             frame = self._read_frame()
-        self._read_secs += time.time() - t
+            took = time.time() - t
+            # From 0, and each read capped at twice the line: the first read's model
+            # load, or one capture that hung, can never mark a fast machine slow alone.
+            self._read_avg = 0.8 * self._read_avg + 0.2 * min(took, 2 * SLOW_READ)
+            # a key, never the image: nothing on the bot may hold a capture
+            self._last_key = frame_key(frame[0]) if self._read_avg >= SLOW_READ else None
+        self._read_secs += took
         self._reads += 1
         return frame
 
@@ -3125,8 +3152,44 @@ class Bot:
         self.log("click %r at %.0f,%.0f (%s)" % (label, pt[0], pt[1], reason))
         return True
 
-    def wait_for(self, want, timeout=5.0):
-        """Poll fresh screens until ui_state is in `want`. Returns (state, img, lines)."""
+    def _await_screen(self) -> None:
+        """With a slow reader, let a click's change draw before the full read.
+
+        A friend's Windows laptop read a screen in 1.8 s, and the first read after a
+        click captured the screen from before it, the buy window still opening: thrown
+        away, then read again. VIEW to PURCHASE took 4 s there against 1 s on a Mac.
+        Only after VIEW (wait_for settle=True): after PURCHASE the first read already
+        caught the confirm box, a dialog too small to count as a change here.
+        Cheap looks (a capture and 576 brightness cells, no text) wait for the screen to
+        change and stop moving, for at most SETTLE_MAX. A fast reader skips all this.
+        """
+        if self._read_avg < SLOW_READ or self._last_key is None:
+            return
+        deadline = time.time() + SETTLE_MAX
+        prev, moved = self._last_key, False
+        while time.time() < deadline and not self.stop_event.is_set():
+            self.sleep(SETTLE_POLL)
+            try:
+                img = self._grab()
+            except Exception:
+                return
+            if img is None:
+                return
+            key = frame_key(img)
+            del img
+            if moved and cells_changed(prev, key) < 0.02:
+                return              # changed, and now holding still
+            if cells_changed(self._last_key, key) >= 0.05:
+                moved = True
+            prev = key
+
+    def wait_for(self, want, timeout=5.0, settle=False):
+        """Poll fresh screens until ui_state is in `want`. Returns (state, img, lines).
+
+        settle: let the screen change before the first read, for a slow reader.
+        """
+        if settle:
+            self._await_screen()
         deadline = time.time() + timeout
         img = lines = None
         while True:
@@ -3684,7 +3747,7 @@ class Bot:
         if not self.click_line(live.button_line, "open %s @%s" % (live.name, card.price)):
             return False
 
-        st, img, lines = self.wait_for(("modal", "modal_scrolled"), 5.0)
+        st, img, lines = self.wait_for(("modal", "modal_scrolled"), 5.0, settle=True)
         if st == "modal_scrolled":
             img, lines = self._unscroll_modal()
             st = self.state_of(lines, img)
