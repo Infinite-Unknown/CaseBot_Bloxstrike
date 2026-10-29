@@ -3313,8 +3313,12 @@ class Bot:
         # same item whose serials share a prefix would be confused. Upgrade path:
         # add the seller, which we already parse.
         same_name = [c for c in parse_cards(lines, 0) if c.name == card.name]
-        if card.serial:
-            exact = [c for c in same_name if c.serial == card.serial]
+        # By digits: the punctuation moves between frames, more on Windows (RapidOCR
+        # read '#1,813,671' then '#1.813,671'), and a scrolled card then counted as
+        # gone past the top every time (a friend's log, 2026-10-29).
+        mine = _serial_digits(card.serial)
+        if mine:
+            exact = [c for c in same_name if _serial_digits(c.serial) == mine]
             if len(exact) == 1:
                 return exact[0]
             # Three Glove Cases on one fixture share the prefix '#3,784', so a
@@ -3324,8 +3328,8 @@ class Bot:
             near = [
                 c
                 for c in same_name
-                if c.serial
-                and (c.serial.startswith(card.serial) or card.serial.startswith(c.serial))
+                if _serial_digits(c.serial)
+                and (_serial_digits(c.serial).startswith(mine) or mine.startswith(_serial_digits(c.serial)))
             ]
             if len(near) == 1:
                 return near[0]
