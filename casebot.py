@@ -3590,6 +3590,8 @@ class Bot:
                        replace(centre, x=self.bounds["Width"] * self.scale * MARKET_WHEEL_X))
         if not self.wait_idle(self.s, self.stop_event):
             return False
+        # said every time, so a log shows whether it looks at all (it never did on Windows)
+        self.log("looking at the rows below (%d notches down)" % notches)
         self.scroll_at(pt, SCROLL_STEP, self.pid, hold=self._hold, notches=notches)
         self.sleep(SETTLE_AFTER_SCROLL)
         try:
@@ -5351,6 +5353,14 @@ class Bot:
             if self.out_of_funds or self.try_buy(lines, balance):
                 return
             if state == "market_ready":
+                # Counting down shows as the pill's colour: RapidOCR (Windows) reads
+                # 'APPLY FILTER' cleanly all through it, where Vision garbles it, so
+                # this state alone never meant counting down there and the rows below
+                # were never looked at (a friend's runs, 2026-10-29).
+                af = find_text(lines, "APPLY FILTER")
+                if (self._peek_due and af is not None and not self.button_ready(img, af)
+                        and self.peek_below(lines, balance)):
+                    return
                 self.refresh(lines)
             else:
                 # counting down: once a refresh, the rows under the first screen
