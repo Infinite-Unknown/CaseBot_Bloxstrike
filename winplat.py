@@ -482,15 +482,24 @@ def find_roblox() -> Tuple[int, int, dict]:
 def grab(hwnd):
     """The window's inside, even under other windows (not minimised), or None.
 
+    Off the screen while Roblox is the window in front there; else PrintWindow.
+
     PrintWindow with PW_RENDERFULLCONTENT asks the compositor for what the game drew.
     A game it cannot see comes back black, which is a failed capture here: the bot
     then reads the screen area instead while Roblox is on top (casebot Bot._grab).
     """
     GRAB_ERROR[0] = ""
-    _, _, w, h = _client_box(hwnd)
+    x, y, w, h = _client_box(hwnd)
     if w <= 0 or h <= 0:
         GRAB_ERROR[0] = "the window has no size"
         return None
+    # On top, the screen already shows the game: copy that. PrintWindow makes the game
+    # redraw for it, and on a friend's PC (2026-10-29) Roblox flashed white on screen
+    # and the capture came back white. It stays for a window something else covers.
+    if _topmost_pid_at((x + w / 2.0, y + h / 2.0), ignore_pid=os.getpid()) == _pid_of(hwnd):
+        img = grab_region({"X": x, "Y": y, "Width": w, "Height": h})
+        if img is not None:
+            return img
     wdc = user32.GetDC(hwnd)
     mdc = gdi32.CreateCompatibleDC(wdc)
     bmp = gdi32.CreateCompatibleBitmap(wdc, w, h)
@@ -509,8 +518,12 @@ def grab(hwnd):
         GRAB_ERROR[0] = "PrintWindow failed"
         return None
     img = Image.frombytes("RGB", (w, h), buf.raw, "raw", "BGRX")
-    if max(hi for _, hi in img.resize((32, 18), Image.BOX).getextrema()) < 8:
-        GRAB_ERROR[0] = "the window captured black"
+    # One flat colour is no game screen. Black was the first way PrintWindow failed;
+    # all white was the second (a friend's PC, 2026-10-29: every SELL trip read nothing
+    # and failed on it). Either way the bot reads the screen area instead (Bot._grab).
+    lo, hi = zip(*img.resize((32, 18), Image.BOX).getextrema())
+    if max(hi) - min(lo) < 8:
+        GRAB_ERROR[0] = "the window captured a blank %s" % ("black" if max(hi) < 128 else "white")
         return None
     return img
 
